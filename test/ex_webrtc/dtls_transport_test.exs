@@ -480,6 +480,26 @@ defmodule ExWebRTC.DTLSTransportTest do
     end
   end
 
+  test "emits :failure_reason with :peer_fingerprint_mismatch before failing on bad fingerprint",
+       %{
+         dtls: dtls,
+         ice_transport: ice_transport,
+         ice_pid: ice_pid
+       } do
+    remote_dtls = ExDTLS.init(mode: :server, dtls_srtp: true)
+
+    # Pass the LOCAL cert fingerprint as if it were the remote's, so the
+    # post-handshake fingerprint check fails.
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    {:ok, _lkm, _rkm, _profile} = check_handshake(dtls, ice_transport, ice_pid, remote_dtls)
+
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :connecting}}
+    assert_receive {:dtls_transport, ^dtls, {:failure_reason, :peer_fingerprint_mismatch}}
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}
+  end
+
   test "stop/1", %{dtls: dtls} do
     assert :ok == DTLSTransport.stop(dtls)
     assert false == Process.alive?(dtls)

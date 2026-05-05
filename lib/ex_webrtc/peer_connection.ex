@@ -97,6 +97,7 @@ defmodule ExWebRTC.PeerConnection do
            | {:ice_connection_state_change, ice_connection_state()}
            | {:ice_gathering_state_change, ice_gathering_state()}
            | {:dtls_transport_state_change, dtls_transport_state()}
+           | {:dtls_transport_failure_reason, atom()}
            | :negotiation_needed
            | {:signaling_state_change, signaling_state()}
            | {:data_channel_state_change, DataChannel.ref(), DataChannel.ready_state()}
@@ -1591,6 +1592,12 @@ defmodule ExWebRTC.PeerConnection do
       |> update_conn_state(next_conn_state)
       |> maybe_connect_sctp()
 
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:dtls_transport, _pid, {:failure_reason, reason}}, state) do
+    notify(state.owner, {:dtls_transport_failure_reason, reason})
     {:noreply, state}
   end
 
