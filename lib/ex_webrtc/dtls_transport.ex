@@ -12,12 +12,19 @@ defmodule ExWebRTC.DTLSTransport do
   @typedoc """
   Messages sent by the DTLSTransport.
   """
-  @type signal() :: {:dtls_transport, pid(), state_change() | rtp_rtcp()}
+  @type signal() :: {:dtls_transport, pid(), state_change() | failure_reason() | rtp_rtcp()}
 
   @typedoc """
   Message sent when DTLSTransport changes its state.
   """
   @type state_change() :: {:state_change, dtls_state()}
+
+  @typedoc """
+  Message sent when DTLSTransport transitions to `:failed` and a reason for the
+  failure is known. Emitted *before* the corresponding `state_change` to `:failed`,
+  so consumers can capture diagnostics for the failure that is about to be reported.
+  """
+  @type failure_reason() :: {:failure_reason, atom()}
 
   @typedoc """
   Message sent when a new RTP/RTCP packet arrives.
@@ -420,8 +427,9 @@ defmodule ExWebRTC.DTLSTransport do
         state = do_close(state)
         {:noreply, state}
 
-      {:error, _reason} ->
+      {:error, reason} ->
         # See W3C WebRTC sec. 5.5.
+        notify(state.owner, {:failure_reason, reason})
         state = update_dtls_state(state, :failed)
         {:noreply, state}
     end
@@ -542,6 +550,7 @@ defmodule ExWebRTC.DTLSTransport do
       {:ok, state}
     else
       Logger.debug("Non-matching peer cert fingerprint.")
+      notify(state.owner, {:failure_reason, :peer_fingerprint_mismatch})
       state = update_dtls_state(state, :failed)
       {:ok, state}
     end
