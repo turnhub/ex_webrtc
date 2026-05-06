@@ -500,6 +500,32 @@ defmodule ExWebRTC.DTLSTransportTest do
     assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}
   end
 
+  test "captures inbound DTLS records during handshake", %{
+    dtls: dtls,
+    ice_transport: ice_transport,
+    ice_pid: ice_pid
+  } do
+    remote_dtls = ExDTLS.init(mode: :client, dtls_srtp: true)
+    {:ok, packets, _timeout} = ExDTLS.do_handshake(remote_dtls)
+
+    :ok = DTLSTransport.start_dtls(dtls, :passive, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    Enum.each(packets, &ice_transport.send_dtls(ice_pid, {:data, &1}))
+
+    # Sync — wait until the GenServer has processed inbound packets.
+    _ = :sys.get_state(dtls)
+
+    state = :sys.get_state(dtls)
+    assert is_list(state.records_received)
+    assert length(state.records_received) > 0
+    assert length(state.records_received) <= 16
+
+    # Records were stored newest-first; the oldest should carry t_ms == 0.
+    oldest = List.last(state.records_received)
+    assert oldest.t_ms == 0
+  end
+
   test "stop/1", %{dtls: dtls} do
     assert :ok == DTLSTransport.stop(dtls)
     assert false == Process.alive?(dtls)

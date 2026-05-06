@@ -170,7 +170,9 @@ defmodule ExWebRTC.DTLSTransport do
       dtls_state: :new,
       dtls: nil,
       mode: nil,
-      packet_loss: 0
+      packet_loss: 0,
+      records_received: [],
+      records_first_ms: nil
     }
 
     notify(state.owner, {:state_change, :new})
@@ -470,6 +472,8 @@ defmodule ExWebRTC.DTLSTransport do
   end
 
   defp handle_ice_data({:data, <<f, _rest::binary>> = data}, state) when f in 20..63 do
+    state = capture_trajectory(state, data)
+
     case ExDTLS.handle_data(state.dtls, data) do
       {:handshake_packets, packets, timeout} when state.ice_connected ->
         :ok = do_send(state, packets)
@@ -653,4 +657,21 @@ defmodule ExWebRTC.DTLSTransport do
   end
 
   defp notify(dst, msg), do: send(dst, {:dtls_transport, self(), msg})
+
+  defp capture_trajectory(%{dtls_state: ds} = state, data) when ds in [:new, :connecting] do
+    now_ms = System.monotonic_time(:millisecond)
+    first_ms = state.records_first_ms || now_ms
+
+    parsed =
+      ExWebRTC.DTLSTransport.RecordTrajectory.parse(data, now_ms, state.records_first_ms)
+
+    records_received =
+      parsed
+      |> Enum.reduce(state.records_received, fn rec, acc -> [rec | acc] end)
+      |> Enum.take(16)
+
+    %{state | records_received: records_received, records_first_ms: first_ms}
+  end
+
+  defp capture_trajectory(state, _data), do: state
 end
