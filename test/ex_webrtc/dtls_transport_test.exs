@@ -530,6 +530,33 @@ defmodule ExWebRTC.DTLSTransportTest do
     assert oldest.t_ms == 0
   end
 
+  test "emits :diagnostics before :failure_reason on inbound DTLS error", %{
+    dtls: dtls,
+    ice_transport: ice_transport,
+    ice_pid: ice_pid
+  } do
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # Drain the local ClientHello so the only outbound traffic that follows
+    # the alert is what the failure path emits (or doesn't).
+    assert_receive {:mock_ice, _client_hello}
+
+    # Fatal handshake_failure alert from "remote" — OpenSSL aborts the
+    # handshake, ExDTLS surfaces {:error, reason}, and the handler must
+    # emit :diagnostics before :failure_reason and transition to :failed.
+    alert = <<21, 254, 253, 0::16, 0::48, 2::16, 2, 40>>
+    ice_transport.send_dtls(ice_pid, {:data, alert})
+
+    assert_receive {:dtls_transport, ^dtls, {:diagnostics, %{records_received: records}}}
+
+    assert [%{content_type: :alert, alert: %{level: :fatal, description: :handshake_failure}}] =
+             records
+
+    assert_receive {:dtls_transport, ^dtls, {:failure_reason, _reason}}
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}
+  end
+
   test "drops trajectory buffer on :connected and does not emit :diagnostics", %{
     dtls: dtls,
     ice_transport: ice_transport,

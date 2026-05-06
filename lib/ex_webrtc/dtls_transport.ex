@@ -422,14 +422,14 @@ defmodule ExWebRTC.DTLSTransport do
       {:ok, state} ->
         {:noreply, state}
 
-      {:error, :peer_closed_for_writing} ->
+      {:error, state, :peer_closed_for_writing} ->
         # See W3C WebRTC sec. 5.5.1
         # peer_closed_for_writing is returned when the remote side
         # sends close_notify alert
         state = do_close(state)
         {:noreply, state}
 
-      {:error, reason} ->
+      {:error, state, reason} ->
         # See W3C WebRTC sec. 5.5.
         # Diagnostics must precede :failure_reason so consumers can attach
         # the record trajectory to the failure event before it fires.
@@ -508,10 +508,10 @@ defmodule ExWebRTC.DTLSTransport do
         notify(state.owner, {:data, data})
         {:ok, state}
 
-      {:error, reason} = error ->
+      {:error, reason} ->
         # TODO: consider buffering DTLS packets that came out of order during the handshake
         Logger.debug("DTLS error: #{reason}")
-        error
+        {:error, state, reason}
     end
   end
 
