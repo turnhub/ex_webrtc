@@ -496,9 +496,10 @@ defmodule ExWebRTC.DTLSTransportTest do
     {:ok, _lkm, _rkm, _profile} = check_handshake(dtls, ice_transport, ice_pid, remote_dtls)
 
     assert_receive {:dtls_transport, ^dtls, {:state_change, :connecting}}
-    assert_receive {:dtls_transport, ^dtls, {:diagnostics, %{records_received: records}}}
-    assert is_list(records)
-    assert length(records) > 0
+
+    assert_receive {:dtls_transport, ^dtls,
+                    {:diagnostics, %{records_received: [_ | _] = _records}}}
+
     assert_receive {:dtls_transport, ^dtls, {:failure_reason, :peer_fingerprint_mismatch}}
     assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}
   end

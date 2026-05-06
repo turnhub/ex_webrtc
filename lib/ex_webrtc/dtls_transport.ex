@@ -431,6 +431,8 @@ defmodule ExWebRTC.DTLSTransport do
 
       {:error, reason} ->
         # See W3C WebRTC sec. 5.5.
+        # Diagnostics must precede :failure_reason so consumers can attach
+        # the record trajectory to the failure event before it fires.
         state = emit_diagnostics(state)
         notify(state.owner, {:failure_reason, reason})
         state = update_dtls_state(state, :failed)
