@@ -162,5 +162,29 @@ defmodule ExWebRTC.DTLSTransport.RecordTrajectoryTest do
       assert [%{content_type: :change_cipher_spec}, %{malformed: true}] =
                RecordTrajectory.parse(good <> bad, 100, nil)
     end
+
+    test "marks handshake record with fragment shorter than 12-byte header" do
+      bytes = record(22, 5, <<1, 2, 3, 4, 5>>)
+
+      assert [
+               %{
+                 content_type: :handshake,
+                 length: 5,
+                 handshake: %{malformed: true, byte_size: 5}
+               }
+             ] = RecordTrajectory.parse(bytes, 100, nil)
+    end
+
+    test "marks alert record with fragment shorter than 2-byte header" do
+      bytes = record(21, 1, <<2>>)
+
+      assert [
+               %{
+                 content_type: :alert,
+                 length: 1,
+                 alert: %{malformed: true, byte_size: 1}
+               }
+             ] = RecordTrajectory.parse(bytes, 100, nil)
+    end
   end
 end
