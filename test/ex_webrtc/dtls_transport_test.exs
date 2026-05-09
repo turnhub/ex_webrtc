@@ -480,7 +480,7 @@ defmodule ExWebRTC.DTLSTransportTest do
     end
   end
 
-  test "emits :failure_reason with :peer_fingerprint_mismatch before failing on bad fingerprint",
+  test "emits :diagnostics and :failure_reason with :peer_fingerprint_mismatch before failing on bad fingerprint",
        %{
          dtls: dtls,
          ice_transport: ice_transport,
@@ -496,8 +496,92 @@ defmodule ExWebRTC.DTLSTransportTest do
     {:ok, _lkm, _rkm, _profile} = check_handshake(dtls, ice_transport, ice_pid, remote_dtls)
 
     assert_receive {:dtls_transport, ^dtls, {:state_change, :connecting}}
+
+    assert_receive {:dtls_transport, ^dtls,
+                    {:diagnostics, %{records_received: [_ | _] = _records}}}
+
     assert_receive {:dtls_transport, ^dtls, {:failure_reason, :peer_fingerprint_mismatch}}
     assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}
+  end
+
+  test "captures inbound DTLS records during handshake", %{
+    dtls: dtls,
+    ice_transport: ice_transport,
+    ice_pid: ice_pid
+  } do
+    remote_dtls = ExDTLS.init(mode: :client, dtls_srtp: true)
+    {:ok, packets, _timeout} = ExDTLS.do_handshake(remote_dtls)
+
+    :ok = DTLSTransport.start_dtls(dtls, :passive, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    Enum.each(packets, &ice_transport.send_dtls(ice_pid, {:data, &1}))
+
+    # Sync — wait until the GenServer has processed inbound packets.
+    _ = :sys.get_state(dtls)
+
+    state = :sys.get_state(dtls)
+    assert is_list(state.records_received)
+    assert length(state.records_received) > 0
+    assert length(state.records_received) <= 16
+
+    # Records were stored newest-first; the oldest should carry t_ms == 0.
+    oldest = List.last(state.records_received)
+    assert oldest.t_ms == 0
+  end
+
+  test "emits :diagnostics before :failure_reason on inbound DTLS error", %{
+    dtls: dtls,
+    ice_transport: ice_transport,
+    ice_pid: ice_pid
+  } do
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # Drain the local ClientHello so the only outbound traffic that follows
+    # the alert is what the failure path emits (or doesn't).
+    assert_receive {:mock_ice, _client_hello}
+
+    # Fatal handshake_failure alert from "remote" — OpenSSL aborts the
+    # handshake, ExDTLS surfaces {:error, reason}, and the handler must
+    # emit :diagnostics before :failure_reason and transition to :failed.
+    alert = <<21, 254, 253, 0::16, 0::48, 2::16, 2, 40>>
+    ice_transport.send_dtls(ice_pid, {:data, alert})
+
+    assert_receive {:dtls_transport, ^dtls, {:diagnostics, %{records_received: records}}}
+
+    assert [%{content_type: :alert, alert: %{level: :fatal, description: :handshake_failure}}] =
+             records
+
+    assert_receive {:dtls_transport, ^dtls, {:failure_reason, _reason}}
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}
+  end
+
+  test "drops trajectory buffer on :connected and does not emit :diagnostics", %{
+    dtls: dtls,
+    ice_transport: ice_transport,
+    ice_pid: ice_pid
+  } do
+    remote_dtls = ExDTLS.init(mode: :server, dtls_srtp: true)
+
+    remote_fingerprint =
+      remote_dtls
+      |> ExDTLS.get_cert()
+      |> ExDTLS.get_cert_fingerprint()
+      |> Utils.hex_dump()
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, remote_fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    {:ok, _lkm, _rkm, _profile} = check_handshake(dtls, ice_transport, ice_pid, remote_dtls)
+
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :connecting}}
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :connected}}
+    refute_receive {:dtls_transport, ^dtls, {:diagnostics, _}}
+
+    state = :sys.get_state(dtls)
+    assert state.records_received == []
+    assert state.records_first_ms == nil
   end
 
   test "stop/1", %{dtls: dtls} do

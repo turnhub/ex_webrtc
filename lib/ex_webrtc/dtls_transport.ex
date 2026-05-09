@@ -170,7 +170,9 @@ defmodule ExWebRTC.DTLSTransport do
       dtls_state: :new,
       dtls: nil,
       mode: nil,
-      packet_loss: 0
+      packet_loss: 0,
+      records_received: [],
+      records_first_ms: nil
     }
 
     notify(state.owner, {:state_change, :new})
@@ -420,15 +422,18 @@ defmodule ExWebRTC.DTLSTransport do
       {:ok, state} ->
         {:noreply, state}
 
-      {:error, :peer_closed_for_writing} ->
+      {:error, state, :peer_closed_for_writing} ->
         # See W3C WebRTC sec. 5.5.1
         # peer_closed_for_writing is returned when the remote side
         # sends close_notify alert
         state = do_close(state)
         {:noreply, state}
 
-      {:error, reason} ->
+      {:error, state, reason} ->
         # See W3C WebRTC sec. 5.5.
+        # Diagnostics must precede :failure_reason so consumers can attach
+        # the record trajectory to the failure event before it fires.
+        state = emit_diagnostics(state)
         notify(state.owner, {:failure_reason, reason})
         state = update_dtls_state(state, :failed)
         {:noreply, state}
@@ -470,6 +475,8 @@ defmodule ExWebRTC.DTLSTransport do
   end
 
   defp handle_ice_data({:data, <<f, _rest::binary>> = data}, state) when f in 20..63 do
+    state = capture_trajectory(state, data)
+
     case ExDTLS.handle_data(state.dtls, data) do
       {:handshake_packets, packets, timeout} when state.ice_connected ->
         :ok = do_send(state, packets)
@@ -501,10 +508,10 @@ defmodule ExWebRTC.DTLSTransport do
         notify(state.owner, {:data, data})
         {:ok, state}
 
-      {:error, reason} = error ->
+      {:error, reason} ->
         # TODO: consider buffering DTLS packets that came out of order during the handshake
         Logger.debug("DTLS error: #{reason}")
-        error
+        {:error, state, reason}
     end
   end
 
@@ -544,12 +551,14 @@ defmodule ExWebRTC.DTLSTransport do
     if peer_fingerprint_matching?(state) do
       :ok = setup_srtp(state, lkm, rkm, profile)
       state = update_dtls_state(state, :connected)
+      state = %{state | records_received: [], records_first_ms: nil}
       state = flush_buffered_remote_rtp_packets(state)
       state = update_remote_cert_info(state)
       :ok = do_send(state, packets)
       {:ok, state}
     else
       Logger.debug("Non-matching peer cert fingerprint.")
+      state = emit_diagnostics(state)
       notify(state.owner, {:failure_reason, :peer_fingerprint_mismatch})
       state = update_dtls_state(state, :failed)
       {:ok, state}
@@ -653,4 +662,27 @@ defmodule ExWebRTC.DTLSTransport do
   end
 
   defp notify(dst, msg), do: send(dst, {:dtls_transport, self(), msg})
+
+  defp emit_diagnostics(state) do
+    records = Enum.reverse(state.records_received)
+    notify(state.owner, {:diagnostics, %{records_received: records}})
+    state
+  end
+
+  defp capture_trajectory(%{dtls_state: ds} = state, data) when ds in [:new, :connecting] do
+    now_ms = System.monotonic_time(:millisecond)
+    first_ms = state.records_first_ms || now_ms
+
+    parsed =
+      ExWebRTC.DTLSTransport.RecordTrajectory.parse(data, now_ms, state.records_first_ms)
+
+    records_received =
+      parsed
+      |> Enum.reduce(state.records_received, fn rec, acc -> [rec | acc] end)
+      |> Enum.take(16)
+
+    %{state | records_received: records_received, records_first_ms: first_ms}
+  end
+
+  defp capture_trajectory(state, _data), do: state
 end

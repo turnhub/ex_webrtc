@@ -98,6 +98,7 @@ defmodule ExWebRTC.PeerConnection do
            | {:ice_gathering_state_change, ice_gathering_state()}
            | {:dtls_transport_state_change, dtls_transport_state()}
            | {:dtls_transport_failure_reason, atom()}
+           | {:dtls_transport_diagnostics, %{records_received: [map()]}}
            | :negotiation_needed
            | {:signaling_state_change, signaling_state()}
            | {:data_channel_state_change, DataChannel.ref(), DataChannel.ready_state()}
@@ -1598,6 +1599,12 @@ defmodule ExWebRTC.PeerConnection do
   @impl true
   def handle_info({:dtls_transport, _pid, {:failure_reason, reason}}, state) do
     notify(state.owner, {:dtls_transport_failure_reason, reason})
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info({:dtls_transport, _pid, {:diagnostics, payload}}, state) do
+    notify(state.owner, {:dtls_transport_diagnostics, payload})
     {:noreply, state}
   end
 
