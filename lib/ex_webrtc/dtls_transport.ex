@@ -105,7 +105,8 @@ defmodule ExWebRTC.DTLSTransport do
     GenServer.call(dtls_transport, :get_fingerprint)
   end
 
-  @spec get_diagnostics(dtls_transport()) :: %{records_received: [map()]}
+  @spec get_diagnostics(dtls_transport()) ::
+          %{records_received: [map()], records_sent: [map()]}
   def get_diagnostics(dtls_transport),
     do: GenServer.call(dtls_transport, :get_diagnostics)
 
@@ -176,6 +177,7 @@ defmodule ExWebRTC.DTLSTransport do
       mode: nil,
       packet_loss: 0,
       records_received: [],
+      records_sent: [],
       records_first_ms: nil
     }
 
@@ -191,6 +193,7 @@ defmodule ExWebRTC.DTLSTransport do
     if state.mode == :active do
       {:ok, packets, timeout} = ExDTLS.do_handshake(state.dtls)
       Process.send_after(self(), :dtls_timeout, timeout)
+      state = capture_outbound(state, packets)
       :ok = do_send(state, packets)
       state = update_dtls_state(state, :connecting)
       Logger.debug("Started DTLS handshake")
@@ -206,6 +209,7 @@ defmodule ExWebRTC.DTLSTransport do
 
     if state.buffered_local_packets do
       Logger.debug("Sending buffered DTLS packets")
+      state = capture_outbound(state, state.buffered_local_packets)
       :ok = do_send(state, state.buffered_local_packets)
       state = %{state | buffered_local_packets: nil}
       {:reply, :ok, state}
@@ -262,7 +266,11 @@ defmodule ExWebRTC.DTLSTransport do
 
   @impl true
   def handle_call(:get_diagnostics, _from, state) do
-    {:reply, %{records_received: Enum.reverse(state.records_received)}, state}
+    {:reply,
+     %{
+       records_received: Enum.reverse(state.records_received),
+       records_sent: Enum.reverse(state.records_sent)
+     }, state}
   end
 
   @impl true
@@ -399,28 +407,33 @@ defmodule ExWebRTC.DTLSTransport do
 
   @impl true
   def handle_info(:dtls_timeout, %{buffered_local_packets: buffered_local_packets} = state) do
-    case ExDTLS.handle_timeout(state.dtls) do
-      {:retransmit, packets, timeout} when state.ice_connected ->
-        :ok = do_send(state, packets)
-        Logger.debug("Retransmitted DTLS packets")
-        Process.send_after(self(), :dtls_timeout, timeout)
+    state =
+      case ExDTLS.handle_timeout(state.dtls) do
+        {:retransmit, packets, timeout} when state.ice_connected ->
+          state = capture_outbound(state, packets)
+          :ok = do_send(state, packets)
+          Logger.debug("Retransmitted DTLS packets")
+          Process.send_after(self(), :dtls_timeout, timeout)
+          state
 
-      {:retransmit, ^buffered_local_packets, timeout} ->
-        # we got DTLS packets from the other side but
-        # we haven't established ICE connection yet so
-        # packets to retransmit have to be the same as dtls_buffered_packets
-        Process.send_after(self(), :dtls_timeout, timeout)
+        {:retransmit, ^buffered_local_packets, timeout} ->
+          # we got DTLS packets from the other side but
+          # we haven't established ICE connection yet so
+          # packets to retransmit have to be the same as dtls_buffered_packets
+          Process.send_after(self(), :dtls_timeout, timeout)
+          state
 
-      {:retransmit, _packets, timeout} ->
-        Logger.warning(
-          "DTLSTransport: Packets to retransmit differ from buffered local packets despite ICE not being connected"
-        )
+        {:retransmit, _packets, timeout} ->
+          Logger.warning(
+            "DTLSTransport: Packets to retransmit differ from buffered local packets despite ICE not being connected"
+          )
 
-        Process.send_after(self(), :dtls_timeout, timeout)
+          Process.send_after(self(), :dtls_timeout, timeout)
+          state
 
-      :ok ->
-        :ok
-    end
+        :ok ->
+          state
+      end
 
     {:noreply, state}
   end
@@ -488,6 +501,7 @@ defmodule ExWebRTC.DTLSTransport do
 
     case ExDTLS.handle_data(state.dtls, data) do
       {:handshake_packets, packets, timeout} when state.ice_connected ->
+        state = capture_outbound(state, packets)
         :ok = do_send(state, packets)
         Process.send_after(self(), :dtls_timeout, timeout)
         state = update_dtls_state(state, :connecting)
@@ -560,7 +574,7 @@ defmodule ExWebRTC.DTLSTransport do
     if peer_fingerprint_matching?(state) do
       :ok = setup_srtp(state, lkm, rkm, profile)
       state = update_dtls_state(state, :connected)
-      state = %{state | records_received: [], records_first_ms: nil}
+      state = %{state | records_received: [], records_sent: [], records_first_ms: nil}
       state = flush_buffered_remote_rtp_packets(state)
       state = update_remote_cert_info(state)
       :ok = do_send(state, packets)
@@ -694,4 +708,25 @@ defmodule ExWebRTC.DTLSTransport do
   end
 
   defp capture_trajectory(state, _data), do: state
+
+  defp capture_outbound(%{dtls_state: ds} = state, packets) when ds in [:new, :connecting] do
+    now_ms = System.monotonic_time(:millisecond)
+    first_ms = state.records_first_ms || now_ms
+
+    parsed =
+      packets
+      |> List.wrap()
+      |> Enum.flat_map(
+        &ExWebRTC.DTLSTransport.RecordTrajectory.parse(&1, now_ms, state.records_first_ms)
+      )
+
+    records_sent =
+      parsed
+      |> Enum.reduce(state.records_sent, fn rec, acc -> [rec | acc] end)
+      |> Enum.take(32)
+
+    %{state | records_sent: records_sent, records_first_ms: first_ms}
+  end
+
+  defp capture_outbound(state, _packets), do: state
 end

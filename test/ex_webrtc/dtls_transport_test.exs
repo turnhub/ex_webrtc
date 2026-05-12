@@ -605,6 +605,56 @@ defmodule ExWebRTC.DTLSTransportTest do
              DTLSTransport.get_diagnostics(dtls)
   end
 
+  test "captures outbound records during the handshake (active mode)", %{dtls: dtls} do
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # ClientHello should have been sent via the mock ICE transport
+    assert_receive {:mock_ice, packets} when is_binary(packets)
+
+    diagnostics = DTLSTransport.get_diagnostics(dtls)
+
+    assert %{records_sent: [_ | _] = sent} = diagnostics
+
+    # First entry is the most recently sent record; Enum.reverse in
+    # the getter means it's the latest. Sanity-check shape:
+    [first | _] = sent
+    assert is_map(first)
+    assert is_integer(first.t_ms)
+    assert is_integer(first.length)
+  end
+
+  test "does not capture outbound records once dtls_state is :connected", %{
+    dtls: dtls,
+    ice_transport: ice_transport,
+    ice_pid: ice_pid
+  } do
+    remote_dtls = ExDTLS.init(mode: :server, dtls_srtp: true)
+
+    remote_fingerprint =
+      remote_dtls
+      |> ExDTLS.get_cert()
+      |> ExDTLS.get_cert_fingerprint()
+      |> Utils.hex_dump()
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, remote_fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    assert {:ok, _, _, _} = check_handshake(dtls, ice_transport, ice_pid, remote_dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :connected}}
+
+    # Records sent during handshake — capture should have stopped at :connected.
+    %{records_sent: handshake_sent} = DTLSTransport.get_diagnostics(dtls)
+    handshake_len = length(handshake_sent)
+
+    # Send some RTP — must not extend records_sent.
+    :ok = DTLSTransport.send_rtp(dtls, @rtp_packet)
+    assert_receive {:mock_ice, _payload}
+
+    %{records_sent: after_rtp_sent} = DTLSTransport.get_diagnostics(dtls)
+    assert length(after_rtp_sent) == handshake_len
+  end
+
   test "stop/1", %{dtls: dtls} do
     assert :ok == DTLSTransport.stop(dtls)
     assert false == Process.alive?(dtls)
