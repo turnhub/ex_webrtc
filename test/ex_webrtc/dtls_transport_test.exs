@@ -657,6 +657,32 @@ defmodule ExWebRTC.DTLSTransportTest do
     assert length(after_rtp_sent) == handshake_len
   end
 
+  test "emit_diagnostics on :failed includes records_sent buffer", %{
+    dtls: dtls,
+    ice_transport: ice_transport,
+    ice_pid: ice_pid
+  } do
+    # Mismatched fingerprint forces the peer-cert path to :failed.
+    bogus_fingerprint =
+      :crypto.hash(:sha256, "not-the-real-cert")
+      |> Utils.hex_dump()
+
+    remote_dtls = ExDTLS.init(mode: :server, dtls_srtp: true)
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, bogus_fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # Drive the handshake to the point where fingerprint check fires.
+    _ = check_handshake(dtls, ice_transport, ice_pid, remote_dtls)
+
+    assert_receive {:dtls_transport, ^dtls,
+                    {:diagnostics, %{records_received: rx, records_sent: tx}}}
+
+    assert is_list(rx)
+    assert is_list(tx)
+    assert_receive {:dtls_transport, ^dtls, {:failure_reason, :peer_fingerprint_mismatch}}
+  end
+
   test "stop/1", %{dtls: dtls} do
     assert :ok == DTLSTransport.stop(dtls)
     assert false == Process.alive?(dtls)

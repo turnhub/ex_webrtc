@@ -687,8 +687,15 @@ defmodule ExWebRTC.DTLSTransport do
   defp notify(dst, msg), do: send(dst, {:dtls_transport, self(), msg})
 
   defp emit_diagnostics(state) do
-    records = Enum.reverse(state.records_received)
-    notify(state.owner, {:diagnostics, %{records_received: records}})
+    notify(
+      state.owner,
+      {:diagnostics,
+       %{
+         records_received: Enum.reverse(state.records_received),
+         records_sent: Enum.reverse(state.records_sent)
+       }}
+    )
+
     state
   end
 
