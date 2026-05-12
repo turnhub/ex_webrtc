@@ -105,7 +105,7 @@ defmodule ExWebRTC.DTLSTransport do
     GenServer.call(dtls_transport, :get_fingerprint)
   end
 
-  @spec get_diagnostics(GenServer.server()) :: %{records_received: [map()]}
+  @spec get_diagnostics(dtls_transport()) :: %{records_received: [map()]}
   def get_diagnostics(dtls_transport),
     do: GenServer.call(dtls_transport, :get_diagnostics)
 

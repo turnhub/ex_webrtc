@@ -584,10 +584,25 @@ defmodule ExWebRTC.DTLSTransportTest do
     assert state.records_first_ms == nil
   end
 
-  test "get_diagnostics/1 returns the current records_received buffer", %{dtls: dtls} do
+  test "get_diagnostics/1 returns records_received in chronological order", %{dtls: dtls} do
     :ok = DTLSTransport.start_dtls(dtls, :passive, @fingerprint)
 
+    # Cold: empty buffer.
     assert %{records_received: []} = DTLSTransport.get_diagnostics(dtls)
+
+    # Inject three known entries. The buffer is prepended-newest-first inside
+    # DTLSTransport state, so we set it in reverse-chronological order and
+    # expect get_diagnostics/1 to reverse it back to chronological.
+    record_a = %{t_ms: 0, content_type: :handshake}
+    record_b = %{t_ms: 5, content_type: :handshake}
+    record_c = %{t_ms: 12, content_type: :change_cipher_spec}
+
+    :sys.replace_state(dtls, fn state ->
+      %{state | records_received: [record_c, record_b, record_a]}
+    end)
+
+    assert %{records_received: [^record_a, ^record_b, ^record_c]} =
+             DTLSTransport.get_diagnostics(dtls)
   end
 
   test "stop/1", %{dtls: dtls} do
