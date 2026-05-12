@@ -584,6 +584,105 @@ defmodule ExWebRTC.DTLSTransportTest do
     assert state.records_first_ms == nil
   end
 
+  test "get_diagnostics/1 returns records_received in chronological order", %{dtls: dtls} do
+    :ok = DTLSTransport.start_dtls(dtls, :passive, @fingerprint)
+
+    # Cold: empty buffer.
+    assert %{records_received: []} = DTLSTransport.get_diagnostics(dtls)
+
+    # Inject three known entries. The buffer is prepended-newest-first inside
+    # DTLSTransport state, so we set it in reverse-chronological order and
+    # expect get_diagnostics/1 to reverse it back to chronological.
+    record_a = %{t_ms: 0, content_type: :handshake}
+    record_b = %{t_ms: 5, content_type: :handshake}
+    record_c = %{t_ms: 12, content_type: :change_cipher_spec}
+
+    :sys.replace_state(dtls, fn state ->
+      %{state | records_received: [record_c, record_b, record_a]}
+    end)
+
+    assert %{records_received: [^record_a, ^record_b, ^record_c]} =
+             DTLSTransport.get_diagnostics(dtls)
+  end
+
+  test "captures outbound records during the handshake (active mode)", %{dtls: dtls} do
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # ClientHello should have been sent via the mock ICE transport
+    assert_receive {:mock_ice, packets} when is_binary(packets)
+
+    diagnostics = DTLSTransport.get_diagnostics(dtls)
+
+    assert %{records_sent: [_ | _] = sent} = diagnostics
+
+    # records_sent is prepended-newest-first internally; get_diagnostics
+    # reverses it, so the first entry here is the chronologically oldest
+    # (earliest sent) record. Sanity-check shape:
+    [first | _] = sent
+    assert is_map(first)
+    assert is_integer(first.t_ms)
+    assert is_integer(first.length)
+    assert first.content_type == :handshake
+  end
+
+  test "does not capture outbound records once dtls_state is :connected", %{
+    dtls: dtls,
+    ice_transport: ice_transport,
+    ice_pid: ice_pid
+  } do
+    remote_dtls = ExDTLS.init(mode: :server, dtls_srtp: true)
+
+    remote_fingerprint =
+      remote_dtls
+      |> ExDTLS.get_cert()
+      |> ExDTLS.get_cert_fingerprint()
+      |> Utils.hex_dump()
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, remote_fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    assert {:ok, _, _, _} = check_handshake(dtls, ice_transport, ice_pid, remote_dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :connected}}
+
+    # Records sent during handshake — capture should have stopped at :connected.
+    %{records_sent: handshake_sent} = DTLSTransport.get_diagnostics(dtls)
+    handshake_len = length(handshake_sent)
+
+    # Send some RTP — must not extend records_sent.
+    :ok = DTLSTransport.send_rtp(dtls, @rtp_packet)
+    assert_receive {:mock_ice, _payload}
+
+    %{records_sent: after_rtp_sent} = DTLSTransport.get_diagnostics(dtls)
+    assert length(after_rtp_sent) == handshake_len
+  end
+
+  test "emit_diagnostics on :failed includes records_sent buffer", %{
+    dtls: dtls,
+    ice_transport: ice_transport,
+    ice_pid: ice_pid
+  } do
+    # Mismatched fingerprint forces the peer-cert path to :failed.
+    bogus_fingerprint =
+      :crypto.hash(:sha256, "not-the-real-cert")
+      |> Utils.hex_dump()
+
+    remote_dtls = ExDTLS.init(mode: :server, dtls_srtp: true)
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, bogus_fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # Drive the handshake to the point where fingerprint check fires.
+    _ = check_handshake(dtls, ice_transport, ice_pid, remote_dtls)
+
+    assert_receive {:dtls_transport, ^dtls,
+                    {:diagnostics, %{records_received: rx, records_sent: tx}}}
+
+    assert is_list(rx)
+    assert is_list(tx)
+    assert_receive {:dtls_transport, ^dtls, {:failure_reason, :peer_fingerprint_mismatch}}
+  end
+
   test "stop/1", %{dtls: dtls} do
     assert :ok == DTLSTransport.stop(dtls)
     assert false == Process.alive?(dtls)

@@ -323,6 +323,19 @@ defmodule ExWebRTC.PeerConnection do
   end
 
   @doc """
+  Returns the current DTLS handshake record trajectory from the underlying transport.
+
+  Returns both inbound (`records_received`) and outbound (`records_sent`) record-layer
+  metadata captured while `dtls_state in [:new, :connecting]`. Buffers reset on `:connected`.
+  Synchronous getter — works regardless of `dtls_state`, including when the handshake
+  has stalled and never transitions to `:failed`.
+  """
+  @spec get_dtls_diagnostics(peer_connection()) ::
+          %{records_received: [map()], records_sent: [map()]}
+  def get_dtls_diagnostics(peer_connection),
+    do: GenServer.call(peer_connection, :get_dtls_diagnostics)
+
+  @doc """
   Returns the signaling state.
 
   For more information, refer to the [RTCPeerConnection: signalingState property](https://developer.mozilla.org/en-US/docs/Web/API/RTCPeerConnection/signalingState).
@@ -752,6 +765,10 @@ defmodule ExWebRTC.PeerConnection do
   def handle_call(:get_dtls_transport_state, _from, state) do
     {:reply, state.dtls_state, state}
   end
+
+  @impl true
+  def handle_call(:get_dtls_diagnostics, _from, state),
+    do: {:reply, DTLSTransport.get_diagnostics(state.dtls_transport), state}
 
   @impl true
   def handle_call(:get_signaling_state, _from, state) do

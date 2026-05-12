@@ -307,6 +307,12 @@ defmodule ExWebRTC.PeerConnectionTest do
     assert PeerConnection.get_dtls_transport_state(pc) == :new
   end
 
+  test "get_dtls_diagnostics/1" do
+    {:ok, pc} = PeerConnection.start_link()
+    assert %{records_received: [], records_sent: []} = PeerConnection.get_dtls_diagnostics(pc)
+    :ok = PeerConnection.stop(pc)
+  end
+
   describe "get_local_description/1" do
     test "includes ICE candidates" do
       {:ok, pc} = PeerConnection.start()
