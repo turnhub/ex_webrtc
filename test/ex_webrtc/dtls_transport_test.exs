@@ -584,6 +584,12 @@ defmodule ExWebRTC.DTLSTransportTest do
     assert state.records_first_ms == nil
   end
 
+  test "get_diagnostics/1 returns the current records_received buffer", %{dtls: dtls} do
+    :ok = DTLSTransport.start_dtls(dtls, :passive, @fingerprint)
+
+    assert %{records_received: []} = DTLSTransport.get_diagnostics(dtls)
+  end
+
   test "stop/1", %{dtls: dtls} do
     assert :ok == DTLSTransport.stop(dtls)
     assert false == Process.alive?(dtls)

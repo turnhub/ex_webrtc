@@ -105,6 +105,10 @@ defmodule ExWebRTC.DTLSTransport do
     GenServer.call(dtls_transport, :get_fingerprint)
   end
 
+  @spec get_diagnostics(GenServer.server()) :: %{records_received: [map()]}
+  def get_diagnostics(dtls_transport),
+    do: GenServer.call(dtls_transport, :get_diagnostics)
+
   @spec start_dtls(dtls_transport(), :active | :passive, binary()) ::
           :ok | {:error, :already_started}
   def start_dtls(dtls_transport, mode, peer_fingerprint) do
@@ -254,6 +258,11 @@ defmodule ExWebRTC.DTLSTransport do
   @impl true
   def handle_call(:get_fingerprint, _from, state) do
     {:reply, state.fingerprint, state}
+  end
+
+  @impl true
+  def handle_call(:get_diagnostics, _from, state) do
+    {:reply, %{records_received: Enum.reverse(state.records_received)}, state}
   end
 
   @impl true
