@@ -322,6 +322,11 @@ defmodule ExWebRTC.PeerConnection do
     GenServer.call(peer_connection, :get_dtls_transport_state)
   end
 
+  @spec get_dtls_diagnostics(peer_connection()) ::
+          %{records_received: [map()], records_sent: [map()]}
+  def get_dtls_diagnostics(peer_connection),
+    do: GenServer.call(peer_connection, :get_dtls_diagnostics)
+
   @doc """
   Returns the signaling state.
 
@@ -752,6 +757,10 @@ defmodule ExWebRTC.PeerConnection do
   def handle_call(:get_dtls_transport_state, _from, state) do
     {:reply, state.dtls_state, state}
   end
+
+  @impl true
+  def handle_call(:get_dtls_diagnostics, _from, state),
+    do: {:reply, DTLSTransport.get_diagnostics(state.dtls_transport), state}
 
   @impl true
   def handle_call(:get_signaling_state, _from, state) do
