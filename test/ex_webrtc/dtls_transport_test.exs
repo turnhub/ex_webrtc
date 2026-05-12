@@ -616,12 +616,14 @@ defmodule ExWebRTC.DTLSTransportTest do
 
     assert %{records_sent: [_ | _] = sent} = diagnostics
 
-    # First entry is the most recently sent record; Enum.reverse in
-    # the getter means it's the latest. Sanity-check shape:
+    # records_sent is prepended-newest-first internally; get_diagnostics
+    # reverses it, so the first entry here is the chronologically oldest
+    # (earliest sent) record. Sanity-check shape:
     [first | _] = sent
     assert is_map(first)
     assert is_integer(first.t_ms)
     assert is_integer(first.length)
+    assert first.content_type == :handshake
   end
 
   test "does not capture outbound records once dtls_state is :connected", %{

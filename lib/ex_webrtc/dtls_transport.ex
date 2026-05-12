@@ -709,6 +709,8 @@ defmodule ExWebRTC.DTLSTransport do
 
   defp capture_trajectory(state, _data), do: state
 
+  # Mirror of capture_trajectory/2 for outbound records. do_send accepts either
+  # a single binary or a list, so List.wrap + flat_map handles both shapes.
   defp capture_outbound(%{dtls_state: ds} = state, packets) when ds in [:new, :connecting] do
     now_ms = System.monotonic_time(:millisecond)
     first_ms = state.records_first_ms || now_ms
@@ -723,6 +725,8 @@ defmodule ExWebRTC.DTLSTransport do
     records_sent =
       parsed
       |> Enum.reduce(state.records_sent, fn rec, acc -> [rec | acc] end)
+      # Cap 32 (vs 16 for inbound) — outbound retransmits accumulate over the
+      # ~20s silent-stall window before terminate.
       |> Enum.take(32)
 
     %{state | records_sent: records_sent, records_first_ms: first_ms}
