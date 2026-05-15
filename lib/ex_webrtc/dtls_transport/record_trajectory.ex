@@ -107,18 +107,64 @@ defmodule ExWebRTC.DTLSTransport.RecordTrajectory do
 
   defp parse_handshake(
          <<type, msg_length::24, message_seq::16, fragment_offset::24, fragment_length::24,
-           _rest::binary>>
+           rest::binary>>
        ) do
-    %{
+    base = %{
       type: Map.get(@handshake_types, type, {:unknown, type}),
       msg_length: msg_length,
       message_seq: message_seq,
       fragment_offset: fragment_offset,
       fragment_length: fragment_length
     }
+
+    # Only inspect the body when the record carries the complete message —
+    # partial fragments cannot be safely interpreted as a typed structure.
+    if fragment_offset == 0 and fragment_length == msg_length and
+         byte_size(rest) >= fragment_length do
+      parse_handshake_body(base, binary_part(rest, 0, fragment_length))
+    else
+      base
+    end
   end
 
   defp parse_handshake(short), do: %{malformed: true, byte_size: byte_size(short)}
+
+  # Extract fields that let downstream consumers cross-check identity of a
+  # handshake message between flights (orphan vs. retransmit) without needing
+  # raw record bytes. Only implemented for handshake types where it answers a
+  # specific question; everything else passes through unchanged.
+
+  defp parse_handshake_body(%{type: :server_hello} = base, body) do
+    case body do
+      <<_vmaj, _vmin, server_random::binary-size(32), sid_len, _sid::binary-size(sid_len),
+        cipher_suite::16, _rest::binary>> ->
+        base
+        |> Map.put(:server_random, Base.encode16(server_random, case: :lower))
+        |> Map.put(:cipher_suite, cipher_suite)
+
+      _ ->
+        base
+    end
+  end
+
+  defp parse_handshake_body(%{type: :server_key_exchange} = base, body) do
+    # ECDHE with curve_type = 3 (named_curve). Other curve types fall through
+    # — the discriminator we care about (ECDH public point) is only meaningful
+    # with named curves and the field set above us is fixed-shape.
+    case body do
+      <<3, named_curve::16, point_len, point::binary-size(point_len), _sig_hash, _sig_alg,
+        sig_len::16, signature::binary-size(sig_len), _rest::binary>> ->
+        base
+        |> Map.put(:ecdh_named_curve, named_curve)
+        |> Map.put(:ecdh_public, Base.encode16(point, case: :lower))
+        |> Map.put(:signature, Base.encode16(signature, case: :lower))
+
+      _ ->
+        base
+    end
+  end
+
+  defp parse_handshake_body(base, _body), do: base
 
   defp parse_alert(<<level, description, _rest::binary>>) do
     %{

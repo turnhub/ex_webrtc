@@ -187,4 +187,132 @@ defmodule ExWebRTC.DTLSTransport.RecordTrajectoryTest do
              ] = RecordTrajectory.parse(bytes, 100, nil)
     end
   end
+
+  describe "parse/3 — server_hello body fields" do
+    # ServerHello body (RFC 5246 §7.4.1.3): Version(2) + Random(32) +
+    # SessionID<0..32> + CipherSuite(2) + CompressionMethod(1) + Extensions<...>.
+    defp server_hello_body(server_random, session_id \\ <<>>, cipher_suite \\ 0xC02B) do
+      <<254, 253, server_random::binary-size(32), byte_size(session_id), session_id::binary,
+        cipher_suite::16, 0>>
+    end
+
+    defp handshake_with_body(type, body, opts \\ []) do
+      message_seq = Keyword.get(opts, :message_seq, 0)
+      fragment_offset = Keyword.get(opts, :fragment_offset, 0)
+      msg_length = byte_size(body)
+      fragment_length = Keyword.get(opts, :fragment_length, msg_length)
+
+      <<type, msg_length::24, message_seq::16, fragment_offset::24, fragment_length::24,
+        body::binary>>
+    end
+
+    test "extracts server_random from a complete ServerHello" do
+      random = :binary.copy(<<0xAB>>, 32)
+      body = server_hello_body(random)
+      hs = handshake_with_body(2, body)
+      bytes = record(22, byte_size(hs), hs)
+
+      hex = Base.encode16(random, case: :lower)
+
+      assert [
+               %{
+                 handshake: %{
+                   type: :server_hello,
+                   server_random: ^hex,
+                   cipher_suite: 0xC02B
+                 }
+               }
+             ] = RecordTrajectory.parse(bytes, 100, nil)
+    end
+
+    test "extracts server_random when session_id is present (non-empty)" do
+      random = :binary.copy(<<0x11>>, 32)
+      session_id = :binary.copy(<<0x22>>, 8)
+      body = server_hello_body(random, session_id)
+      hs = handshake_with_body(2, body)
+      bytes = record(22, byte_size(hs), hs)
+
+      hex = Base.encode16(random, case: :lower)
+
+      assert [%{handshake: %{server_random: ^hex}}] = RecordTrajectory.parse(bytes, 100, nil)
+    end
+
+    test "skips body fields when ServerHello is fragmented" do
+      random = :binary.copy(<<0xCD>>, 32)
+      body = server_hello_body(random)
+      hs = handshake_with_body(2, binary_part(body, 0, 20), fragment_length: 20)
+      bytes = record(22, byte_size(hs), hs)
+
+      [record] = RecordTrajectory.parse(bytes, 100, nil)
+      refute Map.has_key?(record.handshake, :server_random)
+    end
+  end
+
+  describe "parse/3 — server_key_exchange body fields" do
+    # ECDHE ServerKeyExchange (RFC 4492): curve_type(1)=3 named_curve,
+    # named_curve(2), point_len(1), point, sig_hash(1), sig_alg(1),
+    # sig_len(2), signature.
+    defp ske_body(point, signature, named_curve \\ 0x0017) do
+      <<3, named_curve::16, byte_size(point), point::binary, 4, 3, byte_size(signature)::16,
+        signature::binary>>
+    end
+
+    test "extracts ecdh_public, ecdh_named_curve and signature" do
+      point = :binary.copy(<<0xEE>>, 65)
+      signature = :binary.copy(<<0xFF>>, 70)
+      body = ske_body(point, signature)
+      hs = handshake_with_body(12, body)
+      bytes = record(22, byte_size(hs), hs)
+
+      point_hex = Base.encode16(point, case: :lower)
+      sig_hex = Base.encode16(signature, case: :lower)
+
+      assert [
+               %{
+                 handshake: %{
+                   type: :server_key_exchange,
+                   ecdh_named_curve: 0x0017,
+                   ecdh_public: ^point_hex,
+                   signature: ^sig_hex
+                 }
+               }
+             ] = RecordTrajectory.parse(bytes, 100, nil)
+    end
+
+    test "skips body fields when SKE is fragmented" do
+      point = :binary.copy(<<0xEE>>, 65)
+      signature = :binary.copy(<<0xFF>>, 70)
+      body = ske_body(point, signature)
+      hs = handshake_with_body(12, binary_part(body, 0, 30), fragment_length: 30)
+      bytes = record(22, byte_size(hs), hs)
+
+      [record] = RecordTrajectory.parse(bytes, 100, nil)
+      refute Map.has_key?(record.handshake, :ecdh_public)
+      refute Map.has_key?(record.handshake, :signature)
+    end
+
+    test "leaves SKE base fields untouched when body uses unsupported curve_type" do
+      # Non-named-curve (e.g. explicit_prime = 1) — we only extract for
+      # named_curve and fall through cleanly.
+      body = <<1, 0, 0, 0>>
+      hs = handshake_with_body(12, body)
+      bytes = record(22, byte_size(hs), hs)
+
+      [record] = RecordTrajectory.parse(bytes, 100, nil)
+      refute Map.has_key?(record.handshake, :ecdh_public)
+      assert record.handshake.type == :server_key_exchange
+    end
+  end
+
+  describe "parse/3 — body fields not added for other handshake types" do
+    test "Certificate stays as header-only" do
+      hs = <<11, 5::24, 0::16, 0::24, 5::24, 1, 2, 3, 4, 5>>
+      bytes = record(22, byte_size(hs), hs)
+
+      [record] = RecordTrajectory.parse(bytes, 100, nil)
+      assert record.handshake.type == :certificate
+      refute Map.has_key?(record.handshake, :server_random)
+      refute Map.has_key?(record.handshake, :ecdh_public)
+    end
+  end
 end
