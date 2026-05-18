@@ -214,6 +214,7 @@ defmodule ExWebRTC.DTLSTransport do
       state = capture_outbound(state, packets)
       :ok = do_send(state, packets)
       state = update_dtls_state(state, :connecting)
+      state = arm_handshake_deadline(state)
       Logger.debug("Started DTLS handshake")
       {:reply, :ok, state}
     else
@@ -467,6 +468,24 @@ defmodule ExWebRTC.DTLSTransport do
   end
 
   @impl true
+  def handle_info(:dtls_handshake_deadline, %{dtls_state: dtls_state} = state)
+      when dtls_state in [:connected, :closed, :failed] do
+    {:noreply, %{state | handshake_deadline_ref: nil}}
+  end
+
+  @impl true
+  def handle_info(:dtls_handshake_deadline, state) do
+    # :handshake_timeout = peer never responded at all (gen 0).
+    # :handshake_error   = deadline reached during a retry cycle; the peer was responsive
+    #                      enough to trigger restart(s) but the exchange never completed.
+    reason = if state.handshake_gen > 0, do: :handshake_error, else: :handshake_timeout
+    state = emit_diagnostics(state)
+    notify(state.owner, {:failure_reason, reason})
+    state = update_dtls_state(state, :failed)
+    {:noreply, %{state | handshake_deadline_ref: nil}}
+  end
+
+  @impl true
   def handle_info({:ex_ice, _from, {:data, _data} = msg}, state) do
     case handle_ice_data(msg, state) do
       {:ok, state} ->
@@ -601,7 +620,7 @@ defmodule ExWebRTC.DTLSTransport do
 
     if peer_fingerprint_matching?(state) do
       :ok = setup_srtp(state, lkm, rkm, profile)
-      state = update_dtls_state(state, :connected)
+      state = state |> cancel_handshake_deadline() |> update_dtls_state(:connected)
       state = %{state | records_received: [], records_sent: [], records_first_ms: nil}
       state = flush_buffered_remote_rtp_packets(state)
       state = update_remote_cert_info(state)
@@ -651,6 +670,24 @@ defmodule ExWebRTC.DTLSTransport do
     :ok
   end
 
+  defp arm_handshake_deadline(%{dtls_handshake_retry: false} = state), do: state
+
+  defp arm_handshake_deadline(%{handshake_deadline_ref: ref} = state) when is_reference(ref),
+    do: state
+
+  defp arm_handshake_deadline(state) do
+    deadline_ms = state.dtls_handshake_retry[:deadline_ms]
+    ref = Process.send_after(self(), :dtls_handshake_deadline, deadline_ms)
+    %{state | handshake_deadline_ref: ref}
+  end
+
+  defp cancel_handshake_deadline(%{handshake_deadline_ref: nil} = state), do: state
+
+  defp cancel_handshake_deadline(%{handshake_deadline_ref: ref} = state) do
+    Process.cancel_timer(ref)
+    %{state | handshake_deadline_ref: nil}
+  end
+
   defp update_dtls_state(state, dtls_state, otps \\ [])
   defp update_dtls_state(%{dtls_state: dtls_state} = state, dtls_state, _opts), do: state
 
@@ -681,6 +718,7 @@ defmodule ExWebRTC.DTLSTransport do
   end
 
   defp do_close(state, opts \\ []) do
+    state = cancel_handshake_deadline(state)
     {:ok, packets} = ExDTLS.close(state.dtls)
     :ok = do_send(state, packets)
 

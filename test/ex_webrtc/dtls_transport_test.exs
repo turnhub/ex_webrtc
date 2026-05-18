@@ -764,4 +764,26 @@ defmodule ExWebRTC.DTLSTransportTest do
     send(dtls, {:dtls_timeout, 999})
     refute_receive {:mock_ice, _stale_retransmit}, 200
   end
+
+  test "emits :failed with :handshake_timeout when the deadline elapses" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 5, deadline_ms: 150]
+      )
+
+    MockICETransport.on_data(ice_pid, dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :new}}
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # no peer responds — the deadline must fire and fail the transport
+    assert_receive {:dtls_transport, ^dtls, {:diagnostics, _}}, 1_000
+    assert_receive {:dtls_transport, ^dtls, {:failure_reason, :handshake_timeout}}
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}
+  end
 end
