@@ -911,4 +911,41 @@ defmodule ExWebRTC.DTLSTransportTest do
 
     assert_receive {:dtls_transport, ^dtls, {:state_change, :connected}}
   end
+
+  test "a late :dtls_handshake_deadline after :connected does not fail the transport" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 3, deadline_ms: 6_000]
+      )
+
+    MockICETransport.on_data(ice_pid, dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :new}}
+
+    remote_dtls = ExDTLS.init(mode: :server, dtls_srtp: true)
+
+    remote_fingerprint =
+      remote_dtls
+      |> ExDTLS.get_cert()
+      |> ExDTLS.get_cert_fingerprint()
+      |> Utils.hex_dump()
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, remote_fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    assert {:ok, _lkm, _rkm, _profile} =
+             check_handshake(dtls, MockICETransport, ice_pid, remote_dtls)
+
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :connected}}
+
+    # a deadline message that raced past cancellation must be a no-op for a
+    # connected transport — not a :failed transition
+    send(dtls, :dtls_handshake_deadline)
+    refute_receive {:dtls_transport, ^dtls, {:state_change, :failed}}, 200
+
+    assert :sys.get_state(dtls).handshake_deadline_ref == nil
+  end
 end
