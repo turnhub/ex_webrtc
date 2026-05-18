@@ -1582,6 +1582,18 @@ defmodule ExWebRTC.PeerConnectionTest do
     refute_receive {:ex_webrtc, ^pc2, :negotiation_needed}, 0
   end
 
+  test "threads dtls_handshake_retry config to the DTLSTransport" do
+    {:ok, pc} =
+      PeerConnection.start_link(dtls_handshake_retry: [max_attempts: 3, deadline_ms: 6_000])
+
+    dtls_transport = :sys.get_state(pc).dtls_transport
+
+    assert :sys.get_state(dtls_transport).dtls_handshake_retry == [
+             max_attempts: 3,
+             deadline_ms: 6_000
+           ]
+  end
+
   defp flush_mailbox(pid) do
     receive do
       {:ex_webrtc, ^pid, _msg} -> flush_mailbox(pid)
