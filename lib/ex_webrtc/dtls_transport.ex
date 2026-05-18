@@ -7,6 +7,8 @@ defmodule ExWebRTC.DTLSTransport do
 
   alias ExWebRTC.{DefaultICETransport, ICETransport, Utils}
 
+  @default_handshake_retry [max_attempts: 3, deadline_ms: 6_000]
+
   @type dtls_transport() :: pid()
 
   @typedoc """
@@ -59,17 +61,20 @@ defmodule ExWebRTC.DTLSTransport do
   * `ice_transport` - the module implementing the `ExICE.ICETransport` behavior.
   * `ice_pid` - the PID of the ICE transport process which the DTLSTransport interacts with.
   * `logger_metadata` - a keyword list of metadata to be attached to the Logger for all logs emitted by the DTLSTransport process.
+  * `dtls_handshake_retry` - when set to `[max_attempts: n, deadline_ms: ms]`, a failed initial DTLS handshake is retried up to `n` total attempts or until `ms` elapses, whichever comes first. Missing keys fall back to `max_attempts: 3`, `deadline_ms: 6_000`. Defaults to `false` (no retry).
   """
   @type opts() :: [
           ice_transport: ICETransport.t(),
           ice_pid: pid(),
-          logger_metadata: Enumerable.t({atom(), term()})
+          logger_metadata: Enumerable.t({atom(), term()}),
+          dtls_handshake_retry: [max_attempts: pos_integer(), deadline_ms: pos_integer()] | false
         ]
 
   @spec start_link(opts()) :: GenServer.on_start()
   def start_link(opts) do
     ice_transport = opts[:ice_transport] || DefaultICETransport
     logger_metadata = opts[:logger_metadata] || []
+    dtls_handshake_retry = normalize_handshake_retry(opts[:dtls_handshake_retry])
 
     ice_pid = Keyword.fetch!(opts, :ice_pid)
 
@@ -79,8 +84,18 @@ defmodule ExWebRTC.DTLSTransport do
       raise "DTLSTransport requires ice_transport to implement ExWebRTC.ICETransport behaviour."
     end
 
-    GenServer.start_link(__MODULE__, [ice_transport, ice_pid, self(), logger_metadata])
+    GenServer.start_link(
+      __MODULE__,
+      [ice_transport, ice_pid, self(), logger_metadata, dtls_handshake_retry]
+    )
   end
+
+  defp normalize_handshake_retry(retry) when is_list(retry) do
+    merged = Keyword.merge(@default_handshake_retry, retry)
+    [max_attempts: merged[:max_attempts], deadline_ms: merged[:deadline_ms]]
+  end
+
+  defp normalize_handshake_retry(_), do: false
 
   @spec set_ice_connected(dtls_transport()) :: :ok
   def set_ice_connected(dtls_transport) do
@@ -147,7 +162,7 @@ defmodule ExWebRTC.DTLSTransport do
   end
 
   @impl true
-  def init([ice_transport, ice_pid, owner, logger_metadata]) do
+  def init([ice_transport, ice_pid, owner, logger_metadata, dtls_handshake_retry]) do
     Logger.metadata(logger_metadata)
 
     {pkey, cert} = ExDTLS.generate_key_cert()
@@ -178,7 +193,10 @@ defmodule ExWebRTC.DTLSTransport do
       packet_loss: 0,
       records_received: [],
       records_sent: [],
-      records_first_ms: nil
+      records_first_ms: nil,
+      dtls_handshake_retry: dtls_handshake_retry,
+      handshake_gen: 0,
+      handshake_deadline_ref: nil
     }
 
     notify(state.owner, {:state_change, :new})

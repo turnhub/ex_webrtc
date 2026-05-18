@@ -723,4 +723,27 @@ defmodule ExWebRTC.DTLSTransportTest do
       0 -> :ok
     end
   end
+
+  test "stores normalized dtls_handshake_retry config in state" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 2]
+      )
+
+    state = :sys.get_state(dtls)
+    assert state.dtls_handshake_retry == [max_attempts: 2, deadline_ms: 6_000]
+    assert state.handshake_gen == 0
+    assert state.handshake_deadline_ref == nil
+  end
+
+  test "dtls_handshake_retry defaults to false" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+    {:ok, dtls} = DTLSTransport.start_link(ice_transport: MockICETransport, ice_pid: ice_pid)
+
+    assert :sys.get_state(dtls).dtls_handshake_retry == false
+  end
 end
