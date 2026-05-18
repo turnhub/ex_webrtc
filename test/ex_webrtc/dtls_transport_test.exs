@@ -746,4 +746,22 @@ defmodule ExWebRTC.DTLSTransportTest do
 
     assert :sys.get_state(dtls).dtls_handshake_retry == false
   end
+
+  test "a current-generation :dtls_timeout drives a retransmit; a stale one does not", %{
+    dtls: dtls
+  } do
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # drain the initial ClientHello
+    assert_receive {:mock_ice, _client_hello}
+
+    # wait for the natural timer to fire — generation 0 is the live handshake
+    assert_receive {:mock_ice, _retransmit},
+                   1000 + ExUnit.configuration()[:assert_receive_timeout]
+
+    # a non-existent generation must be ignored — no retransmit
+    send(dtls, {:dtls_timeout, 999})
+    refute_receive {:mock_ice, _stale_retransmit}, 200
+  end
 end
