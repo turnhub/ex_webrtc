@@ -948,4 +948,30 @@ defmodule ExWebRTC.DTLSTransportTest do
 
     assert :sys.get_state(dtls).handshake_deadline_ref == nil
   end
+
+  test "does not restart a passive-mode handshake even when retry is enabled" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 3, deadline_ms: 6_000]
+      )
+
+    MockICETransport.on_data(ice_pid, dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :new}}
+
+    :ok = DTLSTransport.start_dtls(dtls, :passive, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # a fatal alert drives a :handshake_error
+    MockICETransport.send_dtls(ice_pid, {:data, @fatal_alert})
+
+    # retry is enabled, but restart is scoped to active mode — a passive
+    # transport must fail, not restart
+    assert_receive {:dtls_transport, ^dtls, {:failure_reason, :handshake_error}}
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}
+    assert :sys.get_state(dtls).handshake_gen == 0
+  end
 end
