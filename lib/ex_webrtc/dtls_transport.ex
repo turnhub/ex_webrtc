@@ -683,9 +683,6 @@ defmodule ExWebRTC.DTLSTransport do
 
   defp arm_handshake_deadline(%{dtls_handshake_retry: false} = state), do: state
 
-  defp arm_handshake_deadline(%{handshake_deadline_ref: ref} = state) when is_reference(ref),
-    do: state
-
   defp arm_handshake_deadline(state) do
     deadline_ms = state.dtls_handshake_retry[:deadline_ms]
     ref = Process.send_after(self(), :dtls_handshake_deadline, deadline_ms)
