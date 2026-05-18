@@ -499,13 +499,24 @@ defmodule ExWebRTC.DTLSTransport do
         {:noreply, state}
 
       {:error, state, reason} ->
-        # See W3C WebRTC sec. 5.5.
-        # Diagnostics must precede :failure_reason so consumers can attach
-        # the record trajectory to the failure event before it fires.
-        state = emit_diagnostics(state)
-        notify(state.owner, {:failure_reason, reason})
-        state = update_dtls_state(state, :failed)
-        {:noreply, state}
+        case maybe_restart_handshake(state, reason) do
+          {:restarted, state} ->
+            {:noreply, state}
+
+          {:give_up, state} ->
+            # See W3C WebRTC sec. 5.5.
+            # Diagnostics must precede :failure_reason so consumers can attach
+            # the record trajectory to the failure event before it fires.
+            state = emit_diagnostics(state)
+            notify(state.owner, {:failure_reason, reason})
+
+            state =
+              state
+              |> cancel_handshake_deadline()
+              |> update_dtls_state(:failed)
+
+            {:noreply, state}
+        end
     end
   end
 
@@ -686,6 +697,65 @@ defmodule ExWebRTC.DTLSTransport do
   defp cancel_handshake_deadline(%{handshake_deadline_ref: ref} = state) do
     Process.cancel_timer(ref)
     %{state | handshake_deadline_ref: nil}
+  end
+
+  # Restart is scoped to a failed *initial* client-mode handshake. Only
+  # :handshake_error is retried — :closed is terminal, and a peer fingerprint
+  # mismatch never reaches this path.
+  defp maybe_restart_handshake(%{dtls_handshake_retry: false} = state, _reason),
+    do: {:give_up, state}
+
+  defp maybe_restart_handshake(%{mode: mode} = state, _reason) when mode != :active,
+    do: {:give_up, state}
+
+  defp maybe_restart_handshake(state, :handshake_error) do
+    max_attempts = state.dtls_handshake_retry[:max_attempts]
+    attempts_used = state.handshake_gen + 1
+
+    deadline_remaining =
+      if is_reference(state.handshake_deadline_ref),
+        do: Process.read_timer(state.handshake_deadline_ref),
+        else: false
+
+    if attempts_used < max_attempts and is_integer(deadline_remaining) do
+      {:restarted, restart_handshake(state)}
+    else
+      {:give_up, state}
+    end
+  end
+
+  defp maybe_restart_handshake(state, _reason), do: {:give_up, state}
+
+  defp restart_handshake(state) do
+    gen = state.handshake_gen + 1
+    max_attempts = state.dtls_handshake_retry[:max_attempts]
+    Logger.info("Restarting DTLS handshake (attempt #{gen + 1} of #{max_attempts})")
+
+    dtls =
+      ExDTLS.init(
+        mode: :client,
+        dtls_srtp: true,
+        pkey: state.pkey,
+        cert: state.cert,
+        verify_peer: true
+      )
+
+    {:ok, packets, timeout} = ExDTLS.do_handshake(dtls)
+
+    state = %{
+      state
+      | dtls: dtls,
+        handshake_gen: gen,
+        buffered_local_packets: nil,
+        records_received: [],
+        records_sent: [],
+        records_first_ms: nil
+    }
+
+    state = capture_outbound(state, packets)
+    :ok = do_send(state, packets)
+    Process.send_after(self(), {:dtls_timeout, gen}, timeout)
+    state
   end
 
   defp update_dtls_state(state, dtls_state, otps \\ [])
