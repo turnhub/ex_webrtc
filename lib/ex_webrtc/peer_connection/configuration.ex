@@ -167,6 +167,9 @@ defmodule ExWebRTC.PeerConnection.Configuration do
   at the very end of the whole connection establishment process. To mitigate this issue, you can eitehr add an empty
   ICE candidate (this will indicate that there won't be further remote candidates and once all connectivity checks pass,
   ICE will nominate the pair), or use aggressive nomination. Defaults to false.
+  * `dtls_handshake_retry` - when set to `[max_attempts: n, deadline_ms: ms]`, the DTLS transport
+  restarts a failed initial handshake up to `n` total attempts or until `ms` elapses, whichever
+  comes first. Defaults to `false` (no retry).
   * `host_to_srflx_ip_mapper` - function called for each host candidate to derive a new "fabricated" srflx candidate from it.
   This function takes host's ip as an argument and should return srflx's ip as a result or nil if for given host candidate
   there should be no srflx one.
@@ -210,7 +213,8 @@ defmodule ExWebRTC.PeerConnection.Configuration do
           features: [feature()],
           rtp_header_extensions: [rtp_header_extension()],
           rtcp_feedbacks: [rtcp_feedback()],
-          logger_metadata: Enumerable.t({atom(), term()})
+          logger_metadata: Enumerable.t({atom(), term()}),
+          dtls_handshake_retry: [max_attempts: pos_integer(), deadline_ms: pos_integer()] | false
         ]
 
   @typedoc """
@@ -233,7 +237,8 @@ defmodule ExWebRTC.PeerConnection.Configuration do
           audio_extensions: [Extmap.t()],
           video_extensions: [Extmap.t()],
           features: [feature()],
-          logger_metadata: Enumerable.t({atom(), term()})
+          logger_metadata: Enumerable.t({atom(), term()}),
+          dtls_handshake_retry: [max_attempts: pos_integer(), deadline_ms: pos_integer()] | false
         }
 
   @enforce_keys [
@@ -253,7 +258,8 @@ defmodule ExWebRTC.PeerConnection.Configuration do
                 audio_codecs: @default_audio_codecs,
                 video_codecs: @default_video_codecs,
                 features: @default_features,
-                logger_metadata: []
+                logger_metadata: [],
+                dtls_handshake_retry: false
               ]
 
   @doc """
