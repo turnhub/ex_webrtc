@@ -506,6 +506,20 @@ defmodule ExWebRTC.PeerConnection.ConfigurationTest do
     assert %Extmap{id: 5, uri: @twcc_uri} = twcc
   end
 
+  describe "dtls_handshake_retry option" do
+    test "defaults to false" do
+      config = Configuration.from_options!([])
+      assert config.dtls_handshake_retry == false
+    end
+
+    test "is carried through from options" do
+      config =
+        Configuration.from_options!(dtls_handshake_retry: [max_attempts: 3, deadline_ms: 6_000])
+
+      assert config.dtls_handshake_retry == [max_attempts: 3, deadline_ms: 6_000]
+    end
+  end
+
   test "expand_default_codecs/1" do
     assert Configuration.expand_default_codecs([]) == []
 

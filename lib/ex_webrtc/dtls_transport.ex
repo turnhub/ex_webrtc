@@ -7,6 +7,8 @@ defmodule ExWebRTC.DTLSTransport do
 
   alias ExWebRTC.{DefaultICETransport, ICETransport, Utils}
 
+  @default_handshake_retry [max_attempts: 3, deadline_ms: 6_000]
+
   @type dtls_transport() :: pid()
 
   @typedoc """
@@ -59,17 +61,20 @@ defmodule ExWebRTC.DTLSTransport do
   * `ice_transport` - the module implementing the `ExICE.ICETransport` behavior.
   * `ice_pid` - the PID of the ICE transport process which the DTLSTransport interacts with.
   * `logger_metadata` - a keyword list of metadata to be attached to the Logger for all logs emitted by the DTLSTransport process.
+  * `dtls_handshake_retry` - when set to `[max_attempts: n, deadline_ms: ms]`, a failed initial DTLS handshake is retried up to `n` total attempts or until `ms` elapses, whichever comes first. Missing keys fall back to `max_attempts: 3`, `deadline_ms: 6_000`. Defaults to `false` (no retry).
   """
   @type opts() :: [
           ice_transport: ICETransport.t(),
           ice_pid: pid(),
-          logger_metadata: Enumerable.t({atom(), term()})
+          logger_metadata: Enumerable.t({atom(), term()}),
+          dtls_handshake_retry: [max_attempts: pos_integer(), deadline_ms: pos_integer()] | false
         ]
 
   @spec start_link(opts()) :: GenServer.on_start()
   def start_link(opts) do
     ice_transport = opts[:ice_transport] || DefaultICETransport
     logger_metadata = opts[:logger_metadata] || []
+    dtls_handshake_retry = normalize_handshake_retry(opts[:dtls_handshake_retry])
 
     ice_pid = Keyword.fetch!(opts, :ice_pid)
 
@@ -79,8 +84,18 @@ defmodule ExWebRTC.DTLSTransport do
       raise "DTLSTransport requires ice_transport to implement ExWebRTC.ICETransport behaviour."
     end
 
-    GenServer.start_link(__MODULE__, [ice_transport, ice_pid, self(), logger_metadata])
+    GenServer.start_link(
+      __MODULE__,
+      [ice_transport, ice_pid, self(), logger_metadata, dtls_handshake_retry]
+    )
   end
+
+  defp normalize_handshake_retry(retry) when is_list(retry) do
+    merged = Keyword.merge(@default_handshake_retry, retry)
+    [max_attempts: merged[:max_attempts], deadline_ms: merged[:deadline_ms]]
+  end
+
+  defp normalize_handshake_retry(_), do: false
 
   @spec set_ice_connected(dtls_transport()) :: :ok
   def set_ice_connected(dtls_transport) do
@@ -147,7 +162,7 @@ defmodule ExWebRTC.DTLSTransport do
   end
 
   @impl true
-  def init([ice_transport, ice_pid, owner, logger_metadata]) do
+  def init([ice_transport, ice_pid, owner, logger_metadata, dtls_handshake_retry]) do
     Logger.metadata(logger_metadata)
 
     {pkey, cert} = ExDTLS.generate_key_cert()
@@ -178,7 +193,10 @@ defmodule ExWebRTC.DTLSTransport do
       packet_loss: 0,
       records_received: [],
       records_sent: [],
-      records_first_ms: nil
+      records_first_ms: nil,
+      dtls_handshake_retry: dtls_handshake_retry,
+      handshake_gen: 0,
+      handshake_deadline_ref: nil
     }
 
     notify(state.owner, {:state_change, :new})
@@ -192,10 +210,11 @@ defmodule ExWebRTC.DTLSTransport do
 
     if state.mode == :active do
       {:ok, packets, timeout} = ExDTLS.do_handshake(state.dtls)
-      Process.send_after(self(), :dtls_timeout, timeout)
+      Process.send_after(self(), {:dtls_timeout, state.handshake_gen}, timeout)
       state = capture_outbound(state, packets)
       :ok = do_send(state, packets)
       state = update_dtls_state(state, :connecting)
+      state = arm_handshake_deadline(state)
       Logger.debug("Started DTLS handshake")
       {:reply, :ok, state}
     else
@@ -399,28 +418,38 @@ defmodule ExWebRTC.DTLSTransport do
   end
 
   @impl true
-  def handle_info(:dtls_timeout, %{dtls: nil} = state) do
+  def handle_info({:dtls_timeout, _gen}, %{dtls: nil} = state) do
     # ignore stale timers that were scheduled before calling
     # close/1 or receiving close_notify DTLS alert
     {:noreply, state}
   end
 
   @impl true
-  def handle_info(:dtls_timeout, %{buffered_local_packets: buffered_local_packets} = state) do
+  def handle_info({:dtls_timeout, gen}, %{handshake_gen: current_gen} = state)
+      when gen != current_gen do
+    # timer from a superseded handshake attempt
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(
+        {:dtls_timeout, _gen},
+        %{buffered_local_packets: buffered_local_packets} = state
+      ) do
     state =
       case ExDTLS.handle_timeout(state.dtls) do
         {:retransmit, packets, timeout} when state.ice_connected ->
           state = capture_outbound(state, packets)
           :ok = do_send(state, packets)
           Logger.debug("Retransmitted DTLS packets")
-          Process.send_after(self(), :dtls_timeout, timeout)
+          Process.send_after(self(), {:dtls_timeout, state.handshake_gen}, timeout)
           state
 
         {:retransmit, ^buffered_local_packets, timeout} ->
           # we got DTLS packets from the other side but
           # we haven't established ICE connection yet so
           # packets to retransmit have to be the same as dtls_buffered_packets
-          Process.send_after(self(), :dtls_timeout, timeout)
+          Process.send_after(self(), {:dtls_timeout, state.handshake_gen}, timeout)
           state
 
         {:retransmit, _packets, timeout} ->
@@ -428,7 +457,7 @@ defmodule ExWebRTC.DTLSTransport do
             "DTLSTransport: Packets to retransmit differ from buffered local packets despite ICE not being connected"
           )
 
-          Process.send_after(self(), :dtls_timeout, timeout)
+          Process.send_after(self(), {:dtls_timeout, state.handshake_gen}, timeout)
           state
 
         :ok ->
@@ -436,6 +465,24 @@ defmodule ExWebRTC.DTLSTransport do
       end
 
     {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:dtls_handshake_deadline, %{dtls_state: dtls_state} = state)
+      when dtls_state in [:connected, :closed, :failed] do
+    {:noreply, %{state | handshake_deadline_ref: nil}}
+  end
+
+  @impl true
+  def handle_info(:dtls_handshake_deadline, state) do
+    # :handshake_timeout = peer never responded at all (gen 0).
+    # :handshake_error   = deadline reached during a retry cycle; the peer was responsive
+    #                      enough to trigger restart(s) but the exchange never completed.
+    reason = if state.handshake_gen > 0, do: :handshake_error, else: :handshake_timeout
+    state = emit_diagnostics(state)
+    notify(state.owner, {:failure_reason, reason})
+    state = update_dtls_state(state, :failed)
+    {:noreply, %{state | handshake_deadline_ref: nil}}
   end
 
   @impl true
@@ -452,13 +499,24 @@ defmodule ExWebRTC.DTLSTransport do
         {:noreply, state}
 
       {:error, state, reason} ->
-        # See W3C WebRTC sec. 5.5.
-        # Diagnostics must precede :failure_reason so consumers can attach
-        # the record trajectory to the failure event before it fires.
-        state = emit_diagnostics(state)
-        notify(state.owner, {:failure_reason, reason})
-        state = update_dtls_state(state, :failed)
-        {:noreply, state}
+        case maybe_restart_handshake(state, reason) do
+          {:restarted, state} ->
+            {:noreply, state}
+
+          {:give_up, state} ->
+            # See W3C WebRTC sec. 5.5.
+            # Diagnostics must precede :failure_reason so consumers can attach
+            # the record trajectory to the failure event before it fires.
+            state = emit_diagnostics(state)
+            notify(state.owner, {:failure_reason, reason})
+
+            state =
+              state
+              |> cancel_handshake_deadline()
+              |> update_dtls_state(:failed)
+
+            {:noreply, state}
+        end
     end
   end
 
@@ -503,7 +561,7 @@ defmodule ExWebRTC.DTLSTransport do
       {:handshake_packets, packets, timeout} when state.ice_connected ->
         state = capture_outbound(state, packets)
         :ok = do_send(state, packets)
-        Process.send_after(self(), :dtls_timeout, timeout)
+        Process.send_after(self(), {:dtls_timeout, state.handshake_gen}, timeout)
         state = update_dtls_state(state, :connecting)
         {:ok, state}
 
@@ -513,7 +571,7 @@ defmodule ExWebRTC.DTLSTransport do
         We will send those packets once ICE is ready.
         """)
 
-        Process.send_after(self(), :dtls_timeout, timeout)
+        Process.send_after(self(), {:dtls_timeout, state.handshake_gen}, timeout)
         state = %{state | buffered_local_packets: packets}
         state = update_dtls_state(state, :connecting)
         {:ok, state}
@@ -573,7 +631,7 @@ defmodule ExWebRTC.DTLSTransport do
 
     if peer_fingerprint_matching?(state) do
       :ok = setup_srtp(state, lkm, rkm, profile)
-      state = update_dtls_state(state, :connected)
+      state = state |> cancel_handshake_deadline() |> update_dtls_state(:connected)
       state = %{state | records_received: [], records_sent: [], records_first_ms: nil}
       state = flush_buffered_remote_rtp_packets(state)
       state = update_remote_cert_info(state)
@@ -623,6 +681,80 @@ defmodule ExWebRTC.DTLSTransport do
     :ok
   end
 
+  defp arm_handshake_deadline(%{dtls_handshake_retry: false} = state), do: state
+
+  defp arm_handshake_deadline(state) do
+    deadline_ms = state.dtls_handshake_retry[:deadline_ms]
+    ref = Process.send_after(self(), :dtls_handshake_deadline, deadline_ms)
+    %{state | handshake_deadline_ref: ref}
+  end
+
+  defp cancel_handshake_deadline(%{handshake_deadline_ref: nil} = state), do: state
+
+  defp cancel_handshake_deadline(%{handshake_deadline_ref: ref} = state) do
+    Process.cancel_timer(ref)
+    %{state | handshake_deadline_ref: nil}
+  end
+
+  # Restart is scoped to a failed *initial* client-mode handshake. Only
+  # :handshake_error is retried — :closed is terminal, and a peer fingerprint
+  # mismatch never reaches this path.
+  defp maybe_restart_handshake(%{dtls_handshake_retry: false} = state, _reason),
+    do: {:give_up, state}
+
+  defp maybe_restart_handshake(%{mode: mode} = state, _reason) when mode != :active,
+    do: {:give_up, state}
+
+  defp maybe_restart_handshake(state, :handshake_error) do
+    max_attempts = state.dtls_handshake_retry[:max_attempts]
+    attempts_used = state.handshake_gen + 1
+
+    deadline_remaining =
+      if is_reference(state.handshake_deadline_ref),
+        do: Process.read_timer(state.handshake_deadline_ref),
+        else: false
+
+    if attempts_used < max_attempts and is_integer(deadline_remaining) do
+      {:restarted, restart_handshake(state)}
+    else
+      {:give_up, state}
+    end
+  end
+
+  defp maybe_restart_handshake(state, _reason), do: {:give_up, state}
+
+  defp restart_handshake(state) do
+    gen = state.handshake_gen + 1
+    max_attempts = state.dtls_handshake_retry[:max_attempts]
+    Logger.info("Restarting DTLS handshake (attempt #{gen + 1} of #{max_attempts})")
+
+    dtls =
+      ExDTLS.init(
+        mode: :client,
+        dtls_srtp: true,
+        pkey: state.pkey,
+        cert: state.cert,
+        verify_peer: true
+      )
+
+    {:ok, packets, timeout} = ExDTLS.do_handshake(dtls)
+
+    state = %{
+      state
+      | dtls: dtls,
+        handshake_gen: gen,
+        buffered_local_packets: nil,
+        records_received: [],
+        records_sent: [],
+        records_first_ms: nil
+    }
+
+    state = capture_outbound(state, packets)
+    :ok = do_send(state, packets)
+    Process.send_after(self(), {:dtls_timeout, gen}, timeout)
+    state
+  end
+
   defp update_dtls_state(state, dtls_state, otps \\ [])
   defp update_dtls_state(%{dtls_state: dtls_state} = state, dtls_state, _opts), do: state
 
@@ -653,6 +785,7 @@ defmodule ExWebRTC.DTLSTransport do
   end
 
   defp do_close(state, opts \\ []) do
+    state = cancel_handshake_deadline(state)
     {:ok, packets} = ExDTLS.close(state.dtls)
     :ok = do_send(state, packets)
 

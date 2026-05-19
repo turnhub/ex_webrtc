@@ -9,6 +9,8 @@ defmodule ExWebRTC.DTLSTransportTest do
                |> ExDTLS.get_cert_fingerprint()
                |> Utils.hex_dump()
 
+  @fatal_alert <<21, 254, 253, 0::16, 0::48, 2::16, 2, 40>>
+
   @rtp_header <<1::1, 0::1, 0::1, 0::1, 0::4, 0::1, 96::7, 1::16, 1::32, 1::32>>
   @next_rtp_header <<1::1, 0::1, 0::1, 0::1, 0::4, 0::1, 96::7, 2::16, 1::32, 1::32>>
   @rtp_payload <<0>>
@@ -722,5 +724,254 @@ defmodule ExWebRTC.DTLSTransportTest do
     after
       0 -> :ok
     end
+  end
+
+  test "restarts the handshake on :handshake_error when retry is enabled" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 3, deadline_ms: 6_000]
+      )
+
+    MockICETransport.on_data(ice_pid, dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :new}}
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # drain ClientHello of attempt 1
+    assert_receive {:mock_ice, _client_hello_1}
+
+    # fatal alert -> :handshake_error -> restart, not failure
+    MockICETransport.send_dtls(ice_pid, {:data, @fatal_alert})
+
+    # a fresh ClientHello (attempt 2) is sent
+    assert_receive {:mock_ice, client_hello_2}
+    assert is_binary(client_hello_2)
+
+    # no failure was surfaced
+    refute_receive {:dtls_transport, ^dtls, {:state_change, :failed}}, 200
+
+    state = :sys.get_state(dtls)
+    assert state.handshake_gen == 1
+    assert state.dtls_state == :connecting
+  end
+
+  test "stores normalized dtls_handshake_retry config in state" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 2]
+      )
+
+    state = :sys.get_state(dtls)
+    assert state.dtls_handshake_retry == [max_attempts: 2, deadline_ms: 6_000]
+    assert state.handshake_gen == 0
+    assert state.handshake_deadline_ref == nil
+  end
+
+  test "dtls_handshake_retry defaults to false" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+    {:ok, dtls} = DTLSTransport.start_link(ice_transport: MockICETransport, ice_pid: ice_pid)
+
+    assert :sys.get_state(dtls).dtls_handshake_retry == false
+  end
+
+  test "a current-generation :dtls_timeout drives a retransmit; a stale one does not", %{
+    dtls: dtls
+  } do
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # drain the initial ClientHello
+    assert_receive {:mock_ice, _client_hello}
+
+    # wait for the natural timer to fire — generation 0 is the live handshake
+    assert_receive {:mock_ice, _retransmit},
+                   1000 + ExUnit.configuration()[:assert_receive_timeout]
+
+    # a non-existent generation must be ignored — no retransmit
+    send(dtls, {:dtls_timeout, 999})
+    refute_receive {:mock_ice, _stale_retransmit}, 200
+  end
+
+  test "emits :failed with :handshake_timeout when the deadline elapses" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 5, deadline_ms: 150]
+      )
+
+    MockICETransport.on_data(ice_pid, dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :new}}
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # no peer responds — the deadline must fire and fail the transport
+    assert_receive {:dtls_transport, ^dtls, {:diagnostics, _}}, 1_000
+    assert_receive {:dtls_transport, ^dtls, {:failure_reason, :handshake_timeout}}
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}
+  end
+
+  test "emits :failed with :handshake_error after the attempt cap is reached" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 2, deadline_ms: 6_000]
+      )
+
+    MockICETransport.on_data(ice_pid, dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :new}}
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # attempt 1 ClientHello
+    assert_receive {:mock_ice, _ch1}
+    MockICETransport.send_dtls(ice_pid, {:data, @fatal_alert})
+
+    # attempt 2 ClientHello (one restart, cap is 2)
+    assert_receive {:mock_ice, _ch2}
+    MockICETransport.send_dtls(ice_pid, {:data, @fatal_alert})
+
+    # cap reached -> fail
+    assert_receive {:dtls_transport, ^dtls, {:failure_reason, :handshake_error}}
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}
+  end
+
+  test "does not crash on inbound DTLS data after the handshake deadline fires" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 5, deadline_ms: 100]
+      )
+
+    MockICETransport.on_data(ice_pid, dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :new}}
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+    assert_receive {:mock_ice, _client_hello}
+
+    # deadline fires with no peer response -> :failed, handshake_deadline_ref is now nil
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}, 1_000
+
+    # a late inbound DTLS packet must not crash the transport
+    MockICETransport.send_dtls(ice_pid, {:data, @fatal_alert})
+    assert is_map(:sys.get_state(dtls))
+  end
+
+  test "completes the handshake after a restart" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 3, deadline_ms: 6_000]
+      )
+
+    MockICETransport.on_data(ice_pid, dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :new}}
+
+    remote_dtls = ExDTLS.init(mode: :server, dtls_srtp: true)
+
+    remote_fingerprint =
+      remote_dtls
+      |> ExDTLS.get_cert()
+      |> ExDTLS.get_cert_fingerprint()
+      |> Utils.hex_dump()
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, remote_fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # drain attempt 1 ClientHello, then fail it
+    assert_receive {:mock_ice, _ch1}
+    MockICETransport.send_dtls(ice_pid, {:data, @fatal_alert})
+
+    # attempt 2 ClientHello — drive a full handshake against a fresh server
+    assert {:ok, _lkm, _rkm, _profile} =
+             check_handshake(dtls, MockICETransport, ice_pid, remote_dtls)
+
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :connected}}
+  end
+
+  test "a late :dtls_handshake_deadline after :connected does not fail the transport" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 3, deadline_ms: 6_000]
+      )
+
+    MockICETransport.on_data(ice_pid, dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :new}}
+
+    remote_dtls = ExDTLS.init(mode: :server, dtls_srtp: true)
+
+    remote_fingerprint =
+      remote_dtls
+      |> ExDTLS.get_cert()
+      |> ExDTLS.get_cert_fingerprint()
+      |> Utils.hex_dump()
+
+    :ok = DTLSTransport.start_dtls(dtls, :active, remote_fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    assert {:ok, _lkm, _rkm, _profile} =
+             check_handshake(dtls, MockICETransport, ice_pid, remote_dtls)
+
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :connected}}
+
+    # a deadline message that raced past cancellation must be a no-op for a
+    # connected transport — not a :failed transition
+    send(dtls, :dtls_handshake_deadline)
+    refute_receive {:dtls_transport, ^dtls, {:state_change, :failed}}, 200
+
+    assert :sys.get_state(dtls).handshake_deadline_ref == nil
+  end
+
+  test "does not restart a passive-mode handshake even when retry is enabled" do
+    {:ok, ice_pid} = MockICETransport.start_link(tester: self())
+
+    {:ok, dtls} =
+      DTLSTransport.start_link(
+        ice_transport: MockICETransport,
+        ice_pid: ice_pid,
+        dtls_handshake_retry: [max_attempts: 3, deadline_ms: 6_000]
+      )
+
+    MockICETransport.on_data(ice_pid, dtls)
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :new}}
+
+    :ok = DTLSTransport.start_dtls(dtls, :passive, @fingerprint)
+    :ok = DTLSTransport.set_ice_connected(dtls)
+
+    # a fatal alert drives a :handshake_error
+    MockICETransport.send_dtls(ice_pid, {:data, @fatal_alert})
+
+    # retry is enabled, but restart is scoped to active mode — a passive
+    # transport must fail, not restart
+    assert_receive {:dtls_transport, ^dtls, {:failure_reason, :handshake_error}}
+    assert_receive {:dtls_transport, ^dtls, {:state_change, :failed}}
+    assert :sys.get_state(dtls).handshake_gen == 0
   end
 end
