@@ -167,6 +167,9 @@ defmodule ExWebRTC.PeerConnection.Configuration do
   at the very end of the whole connection establishment process. To mitigate this issue, you can eitehr add an empty
   ICE candidate (this will indicate that there won't be further remote candidates and once all connectivity checks pass,
   ICE will nominate the pair), or use aggressive nomination. Defaults to false.
+  * `ice_keep_selected_pair` - when `true`, the ICE agent will not switch to a higher-priority
+  candidate pair once one is selected. Defaults to `false`. Set this when a mid-session ICE path
+  change would break an in-progress DTLS handshake (e.g. WhatsApp calls over a TURN relay).
   * `dtls_handshake_retry` - when set to `[max_attempts: n, deadline_ms: ms]`, the DTLS transport
   restarts a failed initial handshake up to `n` total attempts or until `ms` elapses, whichever
   comes first. Defaults to `false` (no retry).
@@ -207,6 +210,7 @@ defmodule ExWebRTC.PeerConnection.Configuration do
           ice_ip_filter: ICEAgent.ip_filter(),
           ice_port_range: Enumerable.t(non_neg_integer()),
           ice_aggressive_nomination: boolean(),
+          ice_keep_selected_pair: boolean(),
           host_to_srflx_ip_mapper: ICEAgent.host_to_srflx_ip_mapper(),
           audio_codecs: [RTPCodecParameters.t()] | [audio_codec_name()],
           video_codecs: [RTPCodecParameters.t()] | [video_codec_name()],
@@ -231,6 +235,7 @@ defmodule ExWebRTC.PeerConnection.Configuration do
           ice_ip_filter: (:inet.ip_address() -> boolean()) | nil,
           ice_port_range: Enumerable.t(non_neg_integer()),
           ice_aggressive_nomination: boolean(),
+          ice_keep_selected_pair: boolean(),
           host_to_srflx_ip_mapper: ICEAgent.host_to_srflx_ip_mapper() | nil,
           audio_codecs: [RTPCodecParameters.t()],
           video_codecs: [RTPCodecParameters.t()],
@@ -254,6 +259,7 @@ defmodule ExWebRTC.PeerConnection.Configuration do
                 ice_transport_protocol: :udp,
                 ice_port_range: [0],
                 ice_aggressive_nomination: false,
+                ice_keep_selected_pair: false,
                 host_to_srflx_ip_mapper: nil,
                 audio_codecs: @default_audio_codecs,
                 video_codecs: @default_video_codecs,
