@@ -630,6 +630,7 @@ defmodule ExWebRTC.PeerConnection do
       transport: config.ice_transport_protocol,
       ip_filter: config.ice_ip_filter,
       aggressive_nomination: config.ice_aggressive_nomination,
+      keep_selected_pair: config.ice_keep_selected_pair,
       host_to_srflx_ip_mapper: config.host_to_srflx_ip_mapper,
       ports: config.ice_port_range,
       on_data: nil,

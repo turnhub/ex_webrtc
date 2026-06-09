@@ -520,6 +520,13 @@ defmodule ExWebRTC.PeerConnection.ConfigurationTest do
     end
   end
 
+  test "ice_keep_selected_pair defaults to false and is set from options" do
+    assert Configuration.from_options!([]).ice_keep_selected_pair == false
+
+    assert Configuration.from_options!(ice_keep_selected_pair: true).ice_keep_selected_pair ==
+             true
+  end
+
   test "expand_default_codecs/1" do
     assert Configuration.expand_default_codecs([]) == []
 
