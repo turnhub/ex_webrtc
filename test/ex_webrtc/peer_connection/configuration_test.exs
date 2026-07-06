@@ -527,6 +527,13 @@ defmodule ExWebRTC.PeerConnection.ConfigurationTest do
              true
   end
 
+  test "ice_keepalive_use_candidate defaults to false and is set from options" do
+    assert Configuration.from_options!([]).ice_keepalive_use_candidate == false
+
+    assert Configuration.from_options!(ice_keepalive_use_candidate: true).ice_keepalive_use_candidate ==
+             true
+  end
+
   test "expand_default_codecs/1" do
     assert Configuration.expand_default_codecs([]) == []
 
