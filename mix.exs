@@ -1,7 +1,7 @@
 defmodule ExWebRTC.MixProject do
   use Mix.Project
 
-  @version "0.21.1"
+  @version "0.21.2"
   @source_url "https://github.com/elixir-webrtc/ex_webrtc"
 
   def project do
