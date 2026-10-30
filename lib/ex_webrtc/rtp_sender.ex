@@ -2,6 +2,8 @@ defmodule ExWebRTC.RTPSender do
   @moduledoc """
   Implementation of the [RTCRtpSender](https://www.w3.org/TR/webrtc/#rtcrtpsender-interface).
   """
+  import Bitwise
+
   require Logger
 
   alias ExRTCP.Packet.{TransportFeedback.NACK, PayloadFeedback.PLI}
@@ -28,6 +30,7 @@ defmodule ExWebRTC.RTPSender do
           # We preallocate them so they can be included in SDP when needed.
           ssrc: non_neg_integer(),
           rtx_ssrc: non_neg_integer(),
+          rtx_seq_no: non_neg_integer(),
           packets_sent: non_neg_integer(),
           bytes_sent: non_neg_integer(),
           retransmitted_packets_sent: non_neg_integer(),
@@ -80,6 +83,7 @@ defmodule ExWebRTC.RTPSender do
       rtp_hdr_exts: %{},
       ssrc: ssrc,
       rtx_ssrc: rtx_ssrc,
+      rtx_seq_no: Enum.random(0..0xFFFF),
       mid: nil,
       packets_sent: 0,
       bytes_sent: 0,
@@ -201,14 +205,19 @@ defmodule ExWebRTC.RTPSender do
   end
 
   def do_send_packet(sender, packet, rtx?) do
-    {pt, ssrc} =
+    {packet, sender} =
       if rtx? do
-        {sender.rtx_codec.payload_type, sender.rtx_ssrc}
-      else
-        {sender.codec.payload_type, sender.ssrc}
-      end
+        packet = %{
+          packet
+          | payload_type: sender.rtx_codec.payload_type,
+            ssrc: sender.rtx_ssrc,
+            sequence_number: sender.rtx_seq_no
+        }
 
-    packet = %{packet | payload_type: pt, ssrc: ssrc}
+        {packet, %{sender | rtx_seq_no: sender.rtx_seq_no + 1 &&& 0xFFFF}}
+      else
+        {%{packet | payload_type: sender.codec.payload_type, ssrc: sender.ssrc}, sender}
+      end
 
     # Add mid header extension only if it was negotiated.
     # The receiver can still demux packets based
@@ -236,7 +245,7 @@ defmodule ExWebRTC.RTPSender do
       end
 
     nack_responder =
-      if sender.outbound_rtx? do
+      if sender.outbound_rtx? and not rtx? do
         NACKResponder.record_packet(sender.nack_responder, packet)
       else
         sender.nack_responder
@@ -270,10 +279,8 @@ defmodule ExWebRTC.RTPSender do
   @doc false
   @spec receive_nack(sender(), NACK.t()) :: {[ExRTP.Packet.t()], sender()}
   def receive_nack(sender, nack) do
-    {packets, nack_responder} = NACKResponder.get_rtx(sender.nack_responder, nack)
-    sender = %{sender | nack_responder: nack_responder, nack_count: sender.nack_count + 1}
-
-    {packets, sender}
+    packets = NACKResponder.get_rtx(sender.nack_responder, nack)
+    {packets, %{sender | nack_count: sender.nack_count + 1}}
   end
 
   @doc false

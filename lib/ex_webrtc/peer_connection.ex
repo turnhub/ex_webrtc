@@ -235,7 +235,8 @@ defmodule ExWebRTC.PeerConnection do
   which one should be used, see `set_sender_codec/3`.
 
   Options:
-    * `rtx?` - send the packet as if it was retransmitted (use SSRC and payload type specific to RTX)
+    * `rtx?` - send the packet as a retransmission, with the SSRC, payload type and next sequence number of RTX.
+      Its payload has to start with the original sequence number (RFC 4588).
   """
   @spec send_rtp(
           peer_connection(),
@@ -1517,8 +1518,7 @@ defmodule ExWebRTC.PeerConnection do
       {tr, idx} ->
         case RTPTransceiver.get_pli(tr, rid) do
           {pli, tr} ->
-            encoded = ExRTCP.Packet.encode(pli)
-            :ok = DTLSTransport.send_rtcp(state.dtls_transport, encoded)
+            send_feedback(state.dtls_transport, pli)
             {:noreply, %{state | transceivers: List.replace_at(state.transceivers, idx, tr)}}
 
           :error ->
@@ -1720,12 +1720,7 @@ defmodule ExWebRTC.PeerConnection do
 
     if twcc_recorder.media_ssrc != nil do
       {feedbacks, twcc_recorder} = TWCCRecorder.get_feedback(twcc_recorder)
-
-      for feedback <- feedbacks do
-        encoded = ExRTCP.Packet.encode(feedback)
-        :ok = DTLSTransport.send_rtcp(state.dtls_transport, encoded)
-      end
-
+      Enum.each(feedbacks, &send_feedback(state.dtls_transport, &1))
       {:noreply, %{state | twcc_recorder: twcc_recorder}}
     else
       {:noreply, state}
@@ -1772,12 +1767,7 @@ defmodule ExWebRTC.PeerConnection do
 
         {tr, idx} ->
           {nacks, tr} = RTPTransceiver.get_nacks(tr)
-
-          for nack <- nacks do
-            encoded = ExRTCP.Packet.encode(nack)
-            :ok = DTLSTransport.send_rtcp(state.dtls_transport, encoded)
-          end
-
+          Enum.each(nacks, &send_feedback(state.dtls_transport, &1))
           List.replace_at(state.transceivers, idx, tr)
       end
 
@@ -2531,6 +2521,15 @@ defmodule ExWebRTC.PeerConnection do
   end
 
   defp maybe_connect_sctp(state), do: state
+
+  # Unless reduced-size RTCP (RFC 5506) is negotiated, every RTCP packet must be
+  # a compound packet that starts with a report (RFC 3550 6.1, RFC 4585 3.1).
+  # Strict peers such as WhatsApp's media relay silently drop standalone feedback.
+  defp send_feedback(dtls_transport, feedback) do
+    report = %ExRTCP.Packet.ReceiverReport{ssrc: feedback.sender_ssrc}
+    encoded = ExRTCP.CompoundPacket.encode([report, feedback])
+    :ok = DTLSTransport.send_rtcp(dtls_transport, encoded)
+  end
 
   defp handle_rtcp_packet(state, %ExRTCP.Packet.ReceiverReport{} = report) do
     with true <- :rtcp_reports in state.config.features,

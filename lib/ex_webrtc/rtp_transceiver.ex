@@ -402,6 +402,10 @@ defmodule ExWebRTC.RTPTransceiver do
     Process.send_after(self(), {:send_nacks, transceiver.id}, @nack_interval)
 
     {nacks, receiver} = RTPReceiver.get_nacks(transceiver.receiver)
+
+    nacks =
+      Enum.map(nacks, fn %NACK{} = nack -> %NACK{nack | sender_ssrc: transceiver.sender.ssrc} end)
+
     transceiver = %{transceiver | receiver: receiver}
 
     {nacks, transceiver}
@@ -411,8 +415,12 @@ defmodule ExWebRTC.RTPTransceiver do
   @spec get_pli(transceiver(), String.t() | nil) :: {PLI.t(), transceiver()} | :error
   def get_pli(transceiver, rid) do
     case RTPReceiver.get_pli(transceiver.receiver, rid) do
-      :error -> :error
-      {pli, receiver} -> {pli, %{transceiver | receiver: receiver}}
+      :error ->
+        :error
+
+      {%PLI{} = pli, receiver} ->
+        pli = %PLI{pli | sender_ssrc: transceiver.sender.ssrc}
+        {pli, %{transceiver | receiver: receiver}}
     end
   end
 

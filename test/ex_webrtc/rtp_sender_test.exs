@@ -1,6 +1,7 @@
 defmodule ExWebRTC.RTPSenderTest do
   use ExUnit.Case, async: true
 
+  alias ExRTCP.Packet.TransportFeedback.NACK
   alias ExRTP.Packet.Extension.SourceDescription
   alias ExSDP.Attribute.Extmap
 
@@ -117,6 +118,63 @@ defmodule ExWebRTC.RTPSenderTest do
     test "when there is no rtx codec", %{sender: sender} do
       sender = RTPSender.update(sender, "1", [], @rtp_hdr_exts)
       assert {<<>>, ^sender} = RTPSender.send_packet(sender, ExRTP.Packet.new(<<>>), true)
+    end
+
+    test "numbers retransmissions in the RTX sequence, whoever builds them" do
+      sender =
+        MediaStreamTrack.new(:video)
+        |> RTPSender.new(@ssrc, @rtx_ssrc, [:outbound_rtx])
+        |> RTPSender.update("1", [@vp8, @rtx], @rtp_hdr_exts)
+
+      packet = ExRTP.Packet.new(<<1, 2>>, sequence_number: 500)
+      {_data, sender} = RTPSender.send_packet(sender, packet, false)
+
+      nack = NACK.from_sequence_numbers(@rtx_ssrc, @ssrc, [500])
+      {[retransmission], sender} = RTPSender.receive_nack(sender, nack)
+      {retransmission, sender} = RTPSender.send_packet(sender, retransmission, true)
+
+      padding = ExRTP.Packet.new(<<501::16>>, sequence_number: 501)
+      {padding, _sender} = RTPSender.send_packet(sender, padding, true)
+
+      assert {:ok,
+              %ExRTP.Packet{
+                ssrc: @rtx_ssrc,
+                payload_type: 124,
+                sequence_number: retransmission_seq_no,
+                payload: <<500::16, 1, 2>>
+              }} = ExRTP.Packet.decode(retransmission)
+
+      padding_seq_no = rem(retransmission_seq_no + 1, 65_536)
+
+      assert {:ok,
+              %ExRTP.Packet{
+                ssrc: @rtx_ssrc,
+                payload_type: 124,
+                sequence_number: ^padding_seq_no,
+                payload: <<501::16>>
+              }} = ExRTP.Packet.decode(padding)
+    end
+
+    test "keeps retransmissions out of the history it answers NACKs from" do
+      sender =
+        MediaStreamTrack.new(:video)
+        |> RTPSender.new(@ssrc, @rtx_ssrc, [:outbound_rtx])
+        |> RTPSender.update("1", [@vp8, @rtx], @rtp_hdr_exts)
+
+      packet = ExRTP.Packet.new(<<1, 2>>, sequence_number: 500)
+      {_data, sender} = RTPSender.send_packet(sender, packet, false)
+
+      sender =
+        Enum.reduce(1..200, sender, fn seq_no, sender ->
+          padding = ExRTP.Packet.new(<<seq_no::16>>, sequence_number: seq_no)
+          {_data, sender} = RTPSender.send_packet(sender, padding, true)
+          sender
+        end)
+
+      nack = NACK.from_sequence_numbers(@rtx_ssrc, @ssrc, [500])
+
+      assert {[%ExRTP.Packet{payload: <<500::16, 1, 2>>}], _sender} =
+               RTPSender.receive_nack(sender, nack)
     end
 
     test "when there is codec", %{sender: sender} do
