@@ -1347,6 +1347,7 @@ defmodule ExWebRTC.PeerConnectionTest do
     end
   end
 
+  @spec sender_ssrc(pid()) :: non_neg_integer()
   defp sender_ssrc(pc) do
     [transceiver] = :sys.get_state(pc).transceivers
     transceiver.sender.ssrc
