@@ -1241,7 +1241,7 @@ defmodule ExWebRTC.PeerConnectionTest do
   # MISC TESTS
 
   describe "RTCP" do
-    test "sends and handles PLI" do
+    test "sends PLI in a compound packet led by a receiver report" do
       # turn off features in order to not receive unwanted RTCP packets
       {:ok, pc1} = PeerConnection.start_link(features: [])
       {:ok, pc2} = PeerConnection.start_link(features: [])
@@ -1260,11 +1260,44 @@ defmodule ExWebRTC.PeerConnectionTest do
 
       assert :ok = PeerConnection.send_pli(pc2, id2)
 
-      assert_receive {:ex_webrtc, ^pc1, {:rtcp, [{^id1, pli}]}}
-      assert %ExRTCP.Packet.PayloadFeedback.PLI{} = pli
+      ssrc = sender_ssrc(pc2)
+
+      assert_receive {:ex_webrtc, ^pc1,
+                      {:rtcp,
+                       [
+                         {_, %ExRTCP.Packet.ReceiverReport{ssrc: ^ssrc, reports: []}},
+                         {^id1, %ExRTCP.Packet.PayloadFeedback.PLI{sender_ssrc: ^ssrc}}
+                       ]}}
     end
 
-    test "sends NACK" do
+    test "sends TWCC feedback in a compound packet led by a receiver report" do
+      # turn off features in order to not receive unwanted RTCP packets
+      {:ok, pc1} = PeerConnection.start_link(features: [:twcc])
+      {:ok, pc2} = PeerConnection.start_link(features: [:twcc])
+
+      track = MediaStreamTrack.new(:video)
+      {:ok, _sender} = PeerConnection.add_track(pc1, track)
+
+      :ok = negotiate(pc1, pc2)
+      :ok = connect(pc1, pc2)
+
+      assert_receive {:ex_webrtc, ^pc2, {:track, %MediaStreamTrack{kind: :video, id: id2}}}
+
+      :ok = PeerConnection.send_rtp(pc1, track.id, ExRTP.Packet.new(<<3, 2, 5>>))
+      assert_receive {:ex_webrtc, ^pc2, {:rtp, ^id2, _rid, _packet}}
+
+      ssrc = sender_ssrc(pc2)
+
+      assert_receive {:ex_webrtc, ^pc1,
+                      {:rtcp,
+                       [
+                         {_, %ExRTCP.Packet.ReceiverReport{ssrc: ^ssrc, reports: []}},
+                         {_, %ExRTCP.Packet.TransportFeedback.CC{sender_ssrc: ^ssrc}}
+                       ]}},
+                     1000
+    end
+
+    test "sends NACK in a compound packet led by a receiver report" do
       # turn off features in order to not receive unwanted RTCP packets
       {:ok, pc1} =
         PeerConnection.start_link(features: [:inbound_rtx, :outbound_rtx], rtcp_feedbacks: [])
@@ -1299,9 +1332,25 @@ defmodule ExWebRTC.PeerConnectionTest do
 
       assert_receive {:ex_webrtc, ^pc2, {:rtp, ^id2, _rid, _packet}}
 
-      assert_receive {:ex_webrtc, ^pc1, {:rtcp, [{^id1, nack}]}}
-      assert %ExRTCP.Packet.TransportFeedback.NACK{nacks: [%{pid: 101}]} = nack
+      ssrc = sender_ssrc(pc2)
+
+      assert_receive {:ex_webrtc, ^pc1,
+                      {:rtcp,
+                       [
+                         {_, %ExRTCP.Packet.ReceiverReport{ssrc: ^ssrc, reports: []}},
+                         {^id1,
+                          %ExRTCP.Packet.TransportFeedback.NACK{
+                            sender_ssrc: ^ssrc,
+                            nacks: [%{pid: 101}]
+                          }}
+                       ]}}
     end
+  end
+
+  @spec sender_ssrc(pid()) :: non_neg_integer()
+  defp sender_ssrc(pc) do
+    [transceiver] = :sys.get_state(pc).transceivers
+    transceiver.sender.ssrc
   end
 
   describe "send data in both directions on a single transceiver" do
